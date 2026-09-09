@@ -1,0 +1,35 @@
+# macOS
+.DS_Store
+
+# Python environments and caches
+**/.venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+
+# Runtime logs and recorded datasets
+*.log
+*.jsonl
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.mov
+*.mp4
+
+# Generated archives and temporary build products
+*.zip
+.vosa-deck-build/
+output/fontcache/
+output/fontdata/
+output/rendered_sp_summary*/

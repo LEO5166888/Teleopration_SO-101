@@ -1,0 +1,12 @@
+Thomas，我現在開始做 S-3 HDF5 recorder。為了讓輸出可以接你的 HDF5 → LeRobot 管線，請把 R-4 的以下欄位契約回覆給我：
+
+1. 使用哪一版 LeRobot dataset 格式？
+2. dataset fps 要多少？
+3. observation.state 的維度、欄位順序與單位是什麼？
+4. action 的維度、欄位順序與單位是什麼？
+5. action 要存 App 原始低維指令 [dx,dy,dz,gripper]，還是模擬器實際 joint target？如果只選一個，另一個要不要保留成額外欄位？
+6. 相機 key、解析度、RGB/BGR，以及 LeRobot 端要存 image 還是 video？
+7. episode_index、frame_index、timestamp、task_index 需要哪些來源欄位？
+8. gripper 的 close/open/hold 要用什麼數值表示？
+
+我會先在每個 timestep 保留：sim time、frame index、手機 command ts/seq、joint pos/vel、EE pose、front RGB、operator delta、實際 joint target、estop 與 command mode。這些是 superset，等你回覆後再凍結主要欄位，不會先假設 action 維度。
