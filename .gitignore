@@ -30,6 +30,10 @@ id_ed25519*
 # Generated archives and temporary build products
 *.zip
 .vosa-deck-build/
+.build/
+.codex-finalizer*/
+.chart-data-*/
+tmp/
 output/fontcache/
 output/fontdata/
 output/rendered_sp_summary*/
