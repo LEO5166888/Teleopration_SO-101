@@ -1,5 +1,9 @@
 # ON-1｜Isaac Sim＋手機 App 環境架設與驗收手冊
 
+> **2026-10-17 更新：Leo 已確認目前 ON-1 只需用 Mac 鍵盤操控。** 目前請改用
+> [ON-1｜Isaac Sim＋Mac 鍵盤操控快速驗收](./ON-1_Isaac_Sim_鍵盤操控_快速驗收.md)。
+> 本文件保留作為之後手機 App 整合的完整流程，不是目前 ON-1 的必要步驟。
+
 更新日期：2026-10-17  
 適用票號：ON-1「環境架設（Joanna）：Isaac Sim 開起來、用 App 按鈕把手臂動起來」  
 Owner：Joanna｜Sprint 6｜截止日：2026-10-23
