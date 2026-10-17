@@ -1,13 +1,15 @@
-"""A-3 v0 WebSocket transport for SO-101 Cartesian translation.
+"""A-3 WebSocket transport for SO-101 Cartesian translation.
 
 This module owns validation, sequencing, state broadcasts, and JSONL logging.
 It intentionally has no Isaac imports; the simulation thread is the only code
-that reads robot state or executes a command.
+that reads robot state or executes a command.  Protocol v0 remains supported
+for the existing Mac tools; Thomas's App uses the schema-compatible v1.
 """
 
 import asyncio
 import concurrent.futures
 import json
+import math
 import queue
 import threading
 import time
@@ -19,6 +21,7 @@ from websockets.legacy.server import serve
 
 
 PROTOCOL_VERSION = 0
+SUPPORTED_PROTOCOL_VERSIONS = {0, 1}
 SUPPORTED_TYPES = {
     "hello",
     "test",
@@ -30,6 +33,12 @@ SUPPORTED_TYPES = {
     "joint_jog_stop",
     "gripper_jog_start",
     "gripper_jog_stop",
+    "orient_start",
+    "orient_update",
+    "orient_stop",
+    "pose_start",
+    "pose_update",
+    "pose_stop",
     "joint_delta",
     "gripper",
     "mode",
@@ -50,9 +59,9 @@ ARM_JOINT_NAMES = {
 }
 
 
-def envelope(kind, seq, payload):
+def envelope(kind, seq, payload, version=PROTOCOL_VERSION):
     return {
-        "v": PROTOCOL_VERSION,
+        "v": version,
         "type": kind,
         "ts": int(time.time() * 1000),
         "seq": seq,
@@ -70,8 +79,11 @@ def validate_envelope(message):
     missing = sorted(required - message.keys())
     if missing:
         return safe_seq, "missing_fields", f"missing fields: {missing}"
-    if type(message["v"]) is not int or message["v"] != PROTOCOL_VERSION:
-        return safe_seq, "unsupported_version", "only v=0 is supported"
+    if (
+        type(message["v"]) is not int
+        or message["v"] not in SUPPORTED_PROTOCOL_VERSIONS
+    ):
+        return safe_seq, "unsupported_version", "supported versions are v=0 and v=1"
     if not isinstance(message["type"], str):
         return safe_seq, "invalid_type", "type must be a string"
     if type(message["ts"]) is not int:
@@ -166,6 +178,103 @@ def validate_empty(payload, kind):
     return None
 
 
+def _finite_number(value):
+    return type(value) in {int, float} and math.isfinite(value)
+
+
+def validate_orient_start(payload):
+    required = {"frame", "rate_hz", "gain", "deadband_deg", "smoothing"}
+    if set(payload) != required:
+        return (
+            "invalid_orient_start",
+            "payload must contain frame, rate_hz, gain, deadband_deg, and smoothing",
+        )
+    if payload["frame"] != "phone_body":
+        return "invalid_orient_frame", "frame must be phone_body"
+    if type(payload["rate_hz"]) is not int or payload["rate_hz"] != 30:
+        return "invalid_orient_rate", "rate_hz must be integer 30"
+    limits = {
+        "gain": (0.1, 2.0),
+        "deadband_deg": (0.0, 15.0),
+        "smoothing": (0.0, 0.95),
+    }
+    for field, (lower, upper) in limits.items():
+        value = payload[field]
+        if not _finite_number(value) or not lower <= value <= upper:
+            return (
+                "invalid_orient_parameter",
+                f"{field} must be finite and within [{lower}, {upper}]",
+            )
+    return None
+
+
+def validate_orient_update(payload):
+    if set(payload) != {"q_rel"}:
+        return "invalid_orient_update", "payload must contain only q_rel"
+    q_rel = payload["q_rel"]
+    if (
+        not isinstance(q_rel, list)
+        or len(q_rel) != 4
+        or not all(_finite_number(value) for value in q_rel)
+    ):
+        return "invalid_orient_quaternion", "q_rel must be four finite numbers"
+    norm = math.sqrt(sum(value * value for value in q_rel))
+    if not 0.98 <= norm <= 1.02:
+        return "invalid_orient_quaternion", "q_rel must be a unit quaternion"
+    return None
+
+
+def validate_pose_start(payload):
+    required = {"frame", "rate_hz", "gain", "deadband_deg", "smoothing"}
+    if set(payload) != required:
+        return (
+            "invalid_pose_start",
+            "payload must contain frame, rate_hz, gain, deadband_deg, and smoothing",
+        )
+    if payload["frame"] != "webxr_local":
+        return "invalid_pose_frame", "frame must be webxr_local"
+    if type(payload["rate_hz"]) is not int or payload["rate_hz"] != 30:
+        return "invalid_pose_rate", "rate_hz must be integer 30"
+    limits = {
+        "gain": (0.1, 2.0),
+        "deadband_deg": (0.0, 15.0),
+        "smoothing": (0.0, 0.95),
+    }
+    for field, (lower, upper) in limits.items():
+        value = payload[field]
+        if not _finite_number(value) or not lower <= value <= upper:
+            return (
+                "invalid_pose_parameter",
+                f"{field} must be finite and within [{lower}, {upper}]",
+            )
+    return None
+
+
+def validate_pose_update(payload):
+    if set(payload) != {"p_rel_m", "q_rel", "gripper_delta"}:
+        return (
+            "invalid_pose_update",
+            "payload must contain only p_rel_m, q_rel, and gripper_delta",
+        )
+    p_rel_m = payload["p_rel_m"]
+    if (
+        not isinstance(p_rel_m, list)
+        or len(p_rel_m) != 3
+        or not all(_finite_number(value) for value in p_rel_m)
+    ):
+        return "invalid_pose_position", "p_rel_m must be three finite numbers"
+    quaternion_error = validate_orient_update({"q_rel": payload["q_rel"]})
+    if quaternion_error is not None:
+        return "invalid_pose_quaternion", quaternion_error[1]
+    gripper_delta = payload["gripper_delta"]
+    if not _finite_number(gripper_delta) or not -1.0 <= gripper_delta <= 1.0:
+        return (
+            "invalid_pose_gripper_delta",
+            "gripper_delta must be finite and within [-1, 1]",
+        )
+    return None
+
+
 class Bridge:
     def __init__(self, host="127.0.0.1", port=8766, log_file=None):
         self.host = host
@@ -186,6 +295,11 @@ class Bridge:
         self.jog_stop_event = threading.Event()
         self.joint_jog_stop_event = threading.Event()
         self.gripper_jog_stop_event = threading.Event()
+        self.orient_stop_event = threading.Event()
+        self.pose_stop_event = threading.Event()
+        # Each client receives responses in the same protocol version it used.
+        # This keeps the v0 Mac tools and Thomas's v1 App interoperable.
+        self.connection_versions = {}
         self.state_lock = threading.Lock()
         self.state = {
             "ee_pos": None,
@@ -247,7 +361,12 @@ class Bridge:
                 await asyncio.sleep(0.05)
 
     async def send(self, ws, kind, seq, payload, send_lock=None):
-        message = envelope(kind, seq, payload)
+        message = envelope(
+            kind,
+            seq,
+            payload,
+            version=self.connection_versions.get(ws, PROTOCOL_VERSION),
+        )
         self.log("out", message)
         text = json.dumps(message, ensure_ascii=False, allow_nan=False)
         if send_lock is None:
@@ -309,6 +428,16 @@ class Bridge:
                     await self.send(
                         ws, "error", seq, {"code": code, "msg": msg}, send_lock
                     )
+                    continue
+
+                negotiated_version = self.connection_versions.get(ws)
+                if negotiated_version is None:
+                    self.connection_versions[ws] = message["v"]
+                elif message["v"] != negotiated_version:
+                    await self.send(ws, "error", message["seq"], {
+                        "code": "version_changed",
+                        "msg": "protocol version must remain constant per connection",
+                    }, send_lock)
                     continue
 
                 seq = message["seq"]
@@ -383,6 +512,8 @@ class Bridge:
                     "jog_stop",
                     "joint_jog_stop",
                     "gripper_jog_stop",
+                    "orient_stop",
+                    "pose_stop",
                 }:
                     command_error = validate_empty(payload, kind)
                     if command_error is not None:
@@ -407,14 +538,52 @@ class Bridge:
                         status, reason = self.request_jog_stop(ws)
                     elif kind == "joint_jog_stop":
                         status, reason = self.request_joint_jog_stop(ws)
-                    else:
+                    elif kind == "gripper_jog_stop":
                         status, reason = self.request_gripper_jog_stop(ws)
+                    elif kind == "orient_stop":
+                        status, reason = self.request_orient_stop(ws)
+                    else:
+                        status, reason = self.request_pose_stop(ws)
                     await self.send(ws, "ack", seq, {
                         "seq": seq,
                         "status": status,
                         "reason": reason,
                     }, send_lock)
                     await self.send_state(ws, seq, send_lock)
+                    continue
+
+
+                if kind == "orient_update":
+                    command_error = validate_orient_update(payload)
+                    if command_error is not None:
+                        code, reason = command_error
+                        await self.send(ws, "error", seq, {
+                            "code": code,
+                            "msg": reason,
+                        }, send_lock)
+                        continue
+                    # orient_update is both the newest target and the keepalive.
+                    # It deliberately has no ACK at 30 Hz.
+                    self.refresh_orient(ws, payload["q_rel"])
+                    continue
+
+                if kind == "pose_update":
+                    command_error = validate_pose_update(payload)
+                    if command_error is not None:
+                        code, reason = command_error
+                        await self.send(ws, "error", seq, {
+                            "code": code,
+                            "msg": reason,
+                        }, send_lock)
+                        continue
+                    # pose_update is an atomic latest-wins target and keepalive.
+                    # It deliberately has no ACK at 30 Hz.
+                    self.refresh_pose(
+                        ws,
+                        payload["p_rel_m"],
+                        payload["q_rel"],
+                        payload["gripper_delta"],
+                    )
                     continue
 
                 if kind == "mode":
@@ -464,6 +633,10 @@ class Bridge:
                     command_error = validate_joint_delta(payload)
                 elif kind == "gripper_jog_start":
                     command_error = validate_gripper_jog_start(payload)
+                elif kind == "orient_start":
+                    command_error = validate_orient_start(payload)
+                elif kind == "pose_start":
+                    command_error = validate_pose_start(payload)
                 elif kind == "joint_delta":
                     command_error = validate_joint_delta(payload)
                 elif kind == "gripper":
@@ -505,6 +678,8 @@ class Bridge:
                                     "jog_start",
                                     "joint_jog_start",
                                     "gripper_jog_start",
+                                    "orient_start",
+                                    "pose_start",
                                 }
                                 else 45.0
                             ),
@@ -516,6 +691,14 @@ class Bridge:
                             self.joint_jog_stop_event.clear()
                         elif kind == "gripper_jog_start":
                             self.gripper_jog_stop_event.clear()
+                        elif kind == "orient_start":
+                            self.orient_stop_event.clear()
+                            request["q_rel"] = [0.0, 0.0, 0.0, 1.0]
+                        elif kind == "pose_start":
+                            self.pose_stop_event.clear()
+                            request["p_rel_m"] = [0.0, 0.0, 0.0]
+                            request["q_rel"] = [0.0, 0.0, 0.0, 1.0]
+                            request["gripper_delta"] = 0.0
                         self.pending = request
                         self.commands.put_nowait(request)
                 if busy:
@@ -538,6 +721,8 @@ class Bridge:
                                 "jog_start",
                                 "joint_jog_start",
                                 "gripper_jog_start",
+                                "orient_start",
+                                "pose_start",
                             }
                             else 50.0
                         ),
@@ -563,6 +748,7 @@ class Bridge:
                     "reason": "control_connection_lost",
                 })
                 self.engage_estop()
+            self.connection_versions.pop(ws, None)
 
     def take(self):
         try:
@@ -576,6 +762,8 @@ class Bridge:
         self.jog_stop_event.set()
         self.joint_jog_stop_event.set()
         self.gripper_jog_stop_event.set()
+        self.orient_stop_event.set()
+        self.pose_stop_event.set()
         self.update_state(estop=True, ik="stopped")
         try:
             queued = self.commands.get_nowait()
@@ -604,6 +792,8 @@ class Bridge:
         self.jog_stop_event.clear()
         self.joint_jog_stop_event.clear()
         self.gripper_jog_stop_event.clear()
+        self.orient_stop_event.clear()
+        self.pose_stop_event.clear()
         self.update_state(estop=False, ik="resetting")
 
     def refresh_hold(self, owner):
@@ -666,6 +856,82 @@ class Bridge:
             request["deadline"] = time.monotonic() + JOG_WATCHDOG_S
             return "ok", "joint_jog_stop_requested"
 
+    def refresh_orient(self, owner, q_rel):
+        with self.command_lock:
+            request = self.pending
+            if (
+                request is None
+                or request.get("owner") is not owner
+                or request["message"]["type"] != "orient_start"
+                or request["future"].done()
+            ):
+                return False
+            request["q_rel"] = list(q_rel)
+            request["deadline"] = time.monotonic() + JOG_WATCHDOG_S
+            return True
+
+    def orient_snapshot(self, request):
+        with self.command_lock:
+            if self.pending is not request or request["future"].done():
+                return None
+            return list(request.get("q_rel", [0.0, 0.0, 0.0, 1.0]))
+
+    def request_orient_stop(self, owner):
+        with self.command_lock:
+            request = self.pending
+            if (
+                request is None
+                or request.get("owner") is not owner
+                or request["message"]["type"] != "orient_start"
+                or request["future"].done()
+            ):
+                return "rejected", "orient_not_active"
+            self.orient_stop_event.set()
+            request["deadline"] = time.monotonic() + JOG_WATCHDOG_S
+            return "ok", "orient_stop_requested"
+
+    def refresh_pose(self, owner, p_rel_m, q_rel, gripper_delta):
+        with self.command_lock:
+            request = self.pending
+            if (
+                request is None
+                or request.get("owner") is not owner
+                or request["message"]["type"] != "pose_start"
+                or request["future"].done()
+            ):
+                return False
+            request["p_rel_m"] = list(p_rel_m)
+            request["q_rel"] = list(q_rel)
+            request["gripper_delta"] = float(gripper_delta)
+            request["deadline"] = time.monotonic() + JOG_WATCHDOG_S
+            return True
+
+    def pose_snapshot(self, request):
+        with self.command_lock:
+            if self.pending is not request or request["future"].done():
+                return None
+            return {
+                "p_rel_m": list(request.get("p_rel_m", [0.0, 0.0, 0.0])),
+                "q_rel": list(
+                    request.get("q_rel", [0.0, 0.0, 0.0, 1.0])
+                ),
+                "gripper_delta": float(request.get("gripper_delta", 0.0)),
+            }
+
+    def request_pose_stop(self, owner):
+        with self.command_lock:
+            request = self.pending
+            if (
+                request is None
+                or request.get("owner") is not owner
+                or request["message"]["type"] != "pose_start"
+                or request["future"].done()
+            ):
+                return "rejected", "pose_not_active"
+            self.pose_stop_event.set()
+            request["deadline"] = time.monotonic() + JOG_WATCHDOG_S
+            return "ok", "pose_stop_requested"
+
     def clear_jog_stop(self):
         self.jog_stop_event.clear()
 
@@ -674,6 +940,12 @@ class Bridge:
 
     def clear_gripper_jog_stop(self):
         self.gripper_jog_stop_event.clear()
+
+    def clear_orient_stop(self):
+        self.orient_stop_event.clear()
+
+    def clear_pose_stop(self):
+        self.pose_stop_event.clear()
 
     def finish(self, request, status, reason, diagnostics=None):
         result = {"status": status, "reason": reason}

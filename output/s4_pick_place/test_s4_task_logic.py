@@ -1,6 +1,14 @@
+import math
 import unittest
 
-from s4_task_logic import StableSuccess, inside_goal, success_sample
+from s4_task_logic import (
+    StableSuccess,
+    inside_goal,
+    map_webxr_translation_to_base,
+    map_webxr_translation_to_tool_heading,
+    quaternion_xyzw_to_rotation_vector,
+    success_sample,
+)
 
 
 class S4TaskLogicTests(unittest.TestCase):
@@ -47,6 +55,70 @@ class S4TaskLogicTests(unittest.TestCase):
         latch.reset()
         self.assertFalse(latch.latched)
         self.assertEqual(latch.count, 0)
+
+    def test_quaternion_rotation_vector_identity_and_x_rotation(self):
+        self.assertEqual(
+            quaternion_xyzw_to_rotation_vector((0.0, 0.0, 0.0, 1.0)),
+            (0.0, 0.0, 0.0),
+        )
+        angle = math.radians(30.0)
+        result = quaternion_xyzw_to_rotation_vector((
+            math.sin(angle / 2.0),
+            0.0,
+            0.0,
+            math.cos(angle / 2.0),
+        ))
+        self.assertAlmostEqual(result[0], angle)
+        self.assertAlmostEqual(result[1], 0.0)
+        self.assertAlmostEqual(result[2], 0.0)
+
+    def test_quaternion_sign_equivalence_and_zero_rejected(self):
+        positive = quaternion_xyzw_to_rotation_vector((0.0, 0.5, 0.0, 0.8660254))
+        negative = quaternion_xyzw_to_rotation_vector((0.0, -0.5, 0.0, -0.8660254))
+        self.assertEqual(positive, negative)
+        with self.assertRaises(ValueError):
+            quaternion_xyzw_to_rotation_vector((0.0, 0.0, 0.0, 0.0))
+
+    def test_webxr_translation_mapping(self):
+        self.assertEqual(
+            map_webxr_translation_to_base((0.10, 0.20, 0.30), gain=0.5),
+            (-0.05, -0.15, 0.10),
+        )
+        # The signs below are the live XRViewer calibration for this iPhone.
+        self.assertEqual(
+            map_webxr_translation_to_base((0.0, 0.0, -0.10)),
+            (0.0, 0.10, 0.0),
+        )
+
+    def test_webxr_translation_mapping_rejects_bad_input(self):
+        with self.assertRaises(ValueError):
+            map_webxr_translation_to_base((0.0, 0.0))
+        with self.assertRaises(ValueError):
+            map_webxr_translation_to_base((0.0, 0.0, 0.0), gain=-1.0)
+
+    def test_tool_heading_mapping_keeps_world_vertical(self):
+        forward_xy = (0.0, -1.0)
+        self.assertEqual(
+            map_webxr_translation_to_tool_heading(
+                (0.10, 0.20, -0.30),
+                forward_xy,
+            ),
+            (0.10, -0.30, 0.20),
+        )
+
+    def test_tool_heading_mapping_normalizes_heading(self):
+        self.assertEqual(
+            map_webxr_translation_to_tool_heading(
+                (0.10, 0.0, 0.0),
+                (0.0, -5.0),
+            ),
+            (0.10, 0.0, 0.0),
+        )
+        with self.assertRaises(ValueError):
+            map_webxr_translation_to_tool_heading(
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0),
+            )
 
 
 if __name__ == "__main__":

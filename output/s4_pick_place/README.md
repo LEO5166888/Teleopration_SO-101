@@ -90,6 +90,50 @@ S4 TASK SELF TEST PASS
 
 WebRTC 中應看到紅色方塊被測試程式放進綠色區域，成功後回到固定起點。這輪只驗證成功判定與自動 reset，不能當作機器人抓取成功證據。
 
+## S-8：新增側視與夾爪跟隨視角
+
+這個功能只改 Isaac Sim 畫面；Thomas App、Mac relay、SSH tunnel 與 `8765/8766` 協定都不需修改。
+
+在原本啟動指令最後加上：
+
+```bash
+--operator-multiview
+```
+
+完整指令的結尾會是：
+
+```bash
+--livestream 1 --enable_cameras --ws-host 127.0.0.1 --ws-port 8766 \
+--operator-multiview
+```
+
+成功時 Server 會顯示：
+
+```text
+S8 MULTIVIEW READY side=/World/S8SideCamera gripper=/World/S8GripperCamera
+S8 operator views enabled: main + side + gripper-follow; extra_viewports=2
+```
+
+三個畫面的用途：
+
+- 原本主視角：整體手臂、桌面與目標區。
+- `S8 Side View`：從桌面側邊看夾爪與紅色方塊，確認方塊是否真的離開桌面。
+- `S8 Gripper View`：模擬剛性安裝的 eye-in-hand 鏡頭。啟動時只用紅色方塊校準一次視線，之後鏡頭的位置與視線都固定在 gripper 的 local frame；不會因方塊的物理微抖而自行轉動。
+
+若 Camera prim 已建立，但當前 Isaac Sim/Kit 版本無法自動開視窗，Server 會顯示 `S8 CAMERAS READY BUT AUTO VIEWPORT UNAVAILABLE`。這時不影響手機控制；在 Isaac Sim 以 `Window > Viewports` 開啟 Viewport 2/3，再分別選擇：
+
+```text
+/World/S8SideCamera
+/World/S8GripperCamera
+```
+
+第一次實機執行要確認：
+
+- [ ] 側視畫面同時看到桌面、方塊底部與夾爪。
+- [ ] 抬高夾爪時，側視畫面能分辨方塊與桌面之間的空隙。
+- [ ] 移動手臂時，夾爪視角會跟著移動，且畫面不會因 wrist roll 翻轉。
+- [ ] 開啟兩個額外 viewport 後，手機指令與 60 Hz 控制仍能正常執行。
+
 ## 第二輪：Thomas App 實際 Pick-and-Place
 
 第一輪通過後在 Docker Terminal 按 `Ctrl-C`，用相同指令重啟，但刪除最後一行的 `--task-self-test`。

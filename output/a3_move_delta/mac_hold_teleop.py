@@ -495,12 +495,38 @@ class HoldTeleop:
             self.status_var.set("Release the held key first")
             return
         if key == "1":
-            self.step = "fine"
+            new_step = "fine"
+            self.step = new_step
             self.refresh_mode()
+            ack = await self.send_with_ack(
+                "mode", {"step": new_step}, timeout=10
+            )
+            result = ack.get("payload", {})
+            self.status_var.set(
+                f"mode: {result.get('status')} / {result.get('reason')}"
+            )
+            print(
+                f"[mode] step={new_step} status={result.get('status')} "
+                f"reason={result.get('reason')}",
+                flush=True,
+            )
             return
         if key == "2":
-            self.step = "coarse"
+            new_step = "coarse"
+            self.step = new_step
             self.refresh_mode()
+            ack = await self.send_with_ack(
+                "mode", {"step": new_step}, timeout=10
+            )
+            result = ack.get("payload", {})
+            self.status_var.set(
+                f"mode: {result.get('status')} / {result.get('reason')}"
+            )
+            print(
+                f"[mode] step={new_step} status={result.get('status')} "
+                f"reason={result.get('reason')}",
+                flush=True,
+            )
             return
         if key == "m":
             self.frame = "tool" if self.frame == "base" else "base"

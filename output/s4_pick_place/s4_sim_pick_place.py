@@ -1,5 +1,34 @@
 #!/usr/bin/env python3
-"""S-4 fixed pick-and-place scene with A3 phone control and automatic reset."""
+"""S-4 固定場景 pick-and-place 主程式。
+
+閱讀這支程式時，先把它想成「一個 60 Hz 的工廠主迴圈」，不要逐行硬讀。
+它同時串起四個部分：
+
+1. 網路入口：``Bridge`` 在另一條 thread 接收手機 WebSocket 命令。
+2. 模擬控制：本檔主 thread 從 queue 取命令，計算 IK／關節目標並推進 Isaac Sim。
+3. 任務判定：``success_sample`` 與 ``StableSuccess`` 判斷方塊是否穩定放入目標區。
+4. 資料錄製：可選擇啟用 ``S3Recorder``，以 30 Hz 寫入 HDF5。
+
+最重要的資料流：
+
+    Phone JSON
+        -> Bridge 驗證並放入 queue
+        -> main() 取出命令
+        -> IK／關節／夾爪控制
+        -> step_simulation() 推進一次物理
+        -> 更新 state、成功條件與 recorder
+        -> Bridge 回傳 ack/state
+
+建議閱讀順序：
+
+    main() 場景建立
+        -> while simulation_app.is_running() 主迴圈
+        -> step_simulation()
+        -> reset_episode()
+        -> 最後再看各種 command_kind 的細節
+
+本次加入的是教學註解，不改變原有控制流程與參數。
+"""
 
 import argparse
 import math
@@ -9,17 +38,33 @@ import time
 import zlib
 from pathlib import Path
 
+# 本地模組：
+# - Bridge：WebSocket thread 與 Isaac Sim 主 thread 之間的通訊橋。
+# - STEP_METERS：把 coarse/fine 轉成實際公尺數。
+# - success_sample / StableSuccess：不依賴 Isaac Sim 的純任務判定邏輯。
 from a3_transport import Bridge, STEP_METERS
-from s4_task_logic import StableSuccess, success_sample
+from s4_task_logic import (
+    StableSuccess,
+    map_webxr_translation_to_tool_heading,
+    quaternion_xyzw_to_rotation_vector,
+    success_sample,
+)
 
+# Isaac Lab 載入 LeIsaac SO-101 asset 前，需要先知道 asset 根目錄。
+# setdefault 表示：外部若已設定就尊重外部值，否則才使用這個預設路徑。
 os.environ.setdefault(
     "LEISAAC_ASSETS_ROOT",
     "/root/Documents/robotics/upstream/leisaac/assets",
 )
 
+# AppLauncher 必須先建立 Isaac Sim 應用程式，之後才能安全 import torch/Isaac Lab 模組。
 from isaaclab.app import AppLauncher
 
 
+# -----------------------------------------------------------------------------
+# [啟動參數]
+# 這些參數只在程式啟動時決定一次，例如 WebSocket port、錄製位置與測試模式。
+# -----------------------------------------------------------------------------
 parser = argparse.ArgumentParser(
     description="S-4: fixed SO-101 pick-and-place scene with A3 controls."
 )
@@ -52,6 +97,16 @@ parser.add_argument(
 parser.add_argument("--camera-width", type=int, default=640)
 parser.add_argument("--camera-height", type=int, default=480)
 parser.add_argument(
+    "--operator-multiview",
+    action="store_true",
+    help=(
+        "create S-8 side and gripper-follow cameras plus two operator viewports; "
+        "phone control remains unchanged"
+    ),
+)
+parser.add_argument("--operator-camera-width", type=int, default=480)
+parser.add_argument("--operator-camera-height", type=int, default=360)
+parser.add_argument(
     "--record-demos",
     action="store_true",
     help="record successful S-4 episodes to the S-3 HDF5 contract",
@@ -82,16 +137,26 @@ if (
     or args_cli.success_display_steps < 1
     or args_cli.camera_width < 1
     or args_cli.camera_height < 1
+    or args_cli.operator_camera_width < 1
+    or args_cli.operator_camera_height < 1
 ):
     parser.error("motion and task step counts must be positive")
 if args_cli.record_demos and args_cli.replay_hdf5:
     parser.error("--record-demos and --replay-hdf5 cannot be used together")
+if args_cli.operator_multiview and not args_cli.enable_cameras:
+    parser.error("--operator-multiview requires --enable_cameras")
 
+# 這裡只是「建立」兩個物件：
+# - bridge 還沒開始監聽，真正啟動在 main() 裡的 bridge.start()。
+# - AppLauncher 會啟動 Isaac Sim，simulation_app 用來判斷視窗是否仍在運作。
 bridge = Bridge(args_cli.ws_host, args_cli.ws_port, args_cli.log_file)
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 
+# -----------------------------------------------------------------------------
+# [Isaac Sim 啟動後才能載入的模組]
+# -----------------------------------------------------------------------------
 import torch
 import isaaclab.sim as sim_utils
 
@@ -102,6 +167,10 @@ from isaaclab.utils.math import matrix_from_quat, quat_inv, subtract_frame_trans
 from leisaac.assets.robots.lerobot import SO101_FOLLOWER_CFG
 
 
+# -----------------------------------------------------------------------------
+# [控制與安全常數]
+# -----------------------------------------------------------------------------
+# Cartesian IK 目前只直接解三個主要手臂關節；wrist 與 gripper 由其他命令控制。
 CARTESIAN_JOINT_NAMES = [
     "shoulder_pan",
     "shoulder_lift",
@@ -118,17 +187,23 @@ INITIAL_JOINT_POS_DEG = {
     "gripper": 0.0,
 }
 
+# move_delta 完成時允許的末端位置誤差。
 PASS_ERROR_M = {"coarse": 0.005, "fine": 0.0020}
 MOVE_STABLE_STEPS = 5
 GRIPPER_STABLE_STEPS = 10
+# DLS（damped least squares）IK 的阻尼；用來降低奇異點附近的不穩定。
 DLS_LAMBDA = 0.05
+# 每個 physics step 最多只允許單一 IK 關節改變 0.01 rad，避免瞬間跳動。
 MAX_JOINT_DELTA_RAD = 0.01
+# 若「命令末端位置」與「實際末端位置」相差超過 10 cm，視為危險並 Estop。
 SAFETY_COMMAND_ERROR_M = 0.10
+# 所有 Cartesian 命令都限制在初始 EE 位置周圍半徑 8 cm 的盒狀工作區。
 WORKSPACE_RADIUS_M = 0.08
 AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
 GRIPPER_TARGET_DEG = {"close": 0.0, "open": 100.0}
 GRIPPER_TOLERANCE_DEG = 2.0
 GRIPPER_CLOSE_COMPLETE_DEG = 10.0
+# 夾爪關閉時，如果實際角度持續跟不上目標角度，推測手指已碰到物體。
 GRIPPER_CONTACT_TRACKING_ERROR_DEG = 1.0
 GRIPPER_CONTACT_CONFIRM_STEPS = 2
 GRIPPER_CONTACT_PRELOAD_DEG = 0.25
@@ -138,13 +213,35 @@ JOINT_STEP_DEG = {"fine": 5.0, "coarse": 15.0}
 JOINT_TRAJECTORY_STEPS = {"fine": 30, "coarse": 90}
 JOINT_TOLERANCE_DEG = 1.0
 JOINT_STABLE_STEPS = 5
+# carrying 版本刻意比較慢，降低夾住方塊後的晃動與碰撞。
 JOINT_JOG_SPEED_DEG_S = {"fine": 45.0, "coarse": 90.0}
 JOINT_JOG_CARRY_SPEED_DEG_S = {"fine": 15.0, "coarse": 30.0}
 JOG_SPEED_M_S = {"fine": 0.090, "coarse": 0.180}
 JOG_CARRY_SPEED_M_S = {"fine": 0.030, "coarse": 0.060}
 GRIPPER_JOG_SPEED_DEG_S = {"fine": 90.0, "coarse": 180.0}
 GRIPPER_JOG_CLOSE_SPEED_DEG_S = {"fine": 30.0, "coarse": 60.0}
+# IMU 姿態模式先做受限的兩軸映射：手機 x 軸旋轉控 wrist_flex，
+# 手機 y 軸旋轉控 wrist_roll，z 軸先忽略。這些上限是單次按住相對於
+# 起始關節角的額外限制，關節本身的 soft limit 仍會再夾一次。
+# XRViewer live calibration: pitching the phone upward should flex the wrist
+# upward.  Roll keeps its previously calibrated sign.
+ORIENT_FLEX_SIGN = 1.0
+ORIENT_ROLL_SIGN = -1.0
+ORIENT_MAX_FLEX_DELTA_DEG = 35.0
+ORIENT_MAX_ROLL_DELTA_DEG = 60.0
+# After direction calibration, use a 1:1 phone-to-EE position gain.  The
+# workspace still clamps every axis to +/-8 cm around the initial pose.
+POSE_POSITION_GAIN = 1.00
+POSE_MAX_SPEED_M_S = 0.40
+POSE_CARRY_MAX_SPEED_M_S = 0.12
+# Pose tracking gets a slightly larger per-step joint budget than button jog;
+# it remains bounded and does not alter the existing button/orientation modes.
+POSE_MAX_JOINT_DELTA_RAD = 0.025
 
+# -----------------------------------------------------------------------------
+# [固定場景與成功條件]
+# 名稱尾端 _W 代表 world frame；_M 代表單位為公尺。
+# -----------------------------------------------------------------------------
 ROBOT_BASE_POS_W = (0.0, 0.0, 0.050)
 ROBOT_SUPPORT_SIZE_M = (0.080, 0.080, 0.050)
 ROBOT_SUPPORT_POS_W = (0.0, 0.0, ROBOT_SUPPORT_SIZE_M[2] / 2.0)
@@ -162,24 +259,201 @@ RESET_ROBOT_SETTLE_STEPS = 30
 RESET_OBJECT_SETTLE_STEPS = 15
 RESET_OBJECT_MAX_ERROR_M = 0.005
 INITIAL_ROBOT_MAX_ERROR_DEG = 3.0
+# -----------------------------------------------------------------------------
+# [S-3 錄製相關設定]
+# operator command 會編碼成整數，方便寫入固定 dtype 的 HDF5 欄位。
+# -----------------------------------------------------------------------------
 S3_CAMERA_EYE_W = (0.45, 0.20, 0.55)
 S3_CAMERA_TARGET_W = (0.035, -0.19, 0.12)
+# S-8 操作輔助視角。Side Camera 固定在桌面側邊，重點是看清楚方塊
+# 與桌面間有沒有空隙。Gripper Camera 會跟著末端位置移動，但保持世界座標
+# 的水平方向，避免 wrist roll 讓操作畫面整張旋轉。
+S8_SIDE_CAMERA_PRIM_PATH = "/World/S8SideCamera"
+S8_GRIPPER_CAMERA_PRIM_PATH = "/World/S8GripperCamera"
+S8_SIDE_CAMERA_EYE_W = (0.32, -0.20, 0.15)
+S8_SIDE_CAMERA_TARGET_W = (0.02, -0.20, 0.11)
+# Eye-in-hand 擺位：鏡頭從夾爪後上方移到「前上方」，視線對準
+# 兩根手指之間的前下方。這樣不會讓 wrist 外殼擋住被夾物。
+S8_GRIPPER_CAMERA_EYE_OFFSET_W = (0.0, -0.015, 0.065)
+S8_GRIPPER_CAMERA_TARGET_OFFSET_W = (0.0, -0.120, -0.055)
+# WebRTC 操作版面：兩個額外 viewport 疊在主 viewport 的左側，主視角自然
+# 保留在右半邊。數值依目前 1828x977 操作畫面校準，啟動時每次套用。
+S8_OPERATOR_WINDOW_X = 10
+S8_OPERATOR_TOP_Y = 30
+S8_OPERATOR_WINDOW_WIDTH = 750
+S8_OPERATOR_WINDOW_HEIGHT = 440
+S8_OPERATOR_WINDOW_GAP = 10
 S3_COMMAND_TYPE = {
     "move_delta": 1,
     "jog_start": 1,
     "joint_delta": 2,
     "joint_jog_start": 2,
+    "orient_start": 2,
+    "pose_start": 4,
     "gripper": 3,
     "gripper_jog_start": 3,
 }
 S3_STEP_MODE = {"fine": 1, "coarse": 2}
+# 這三個全域 hook 讓 step_simulation() 不用知道 recorder 的實作細節：
+# 啟用錄製時會被 main() 填入；沒啟用時保持 None，不會做額外工作。
 _S3_CAMERA = None
 _S3_BEFORE_STEP = None
 _S3_RECORDER = None
+_S8_GRIPPER_CAMERA = None
+_S8_EE_BODY_ID = None
+_S8_TASK_OBJECT = None
+_S8_GRIPPER_EYE_OFFSET_EE = None
+_S8_GRIPPER_TARGET_OFFSET_EE = None
+
+
+def update_s8_gripper_camera(robot):
+    """讓 S-8 夾爪視角像真實 eye-in-hand 一樣剛性固定在末端。
+
+    啟動時只利用任務方塊校準一次鏡頭擺位，並把鏡頭與看向點的
+    位移轉成 EE local frame。之後每個 frame 只由 EE pose 重建鏡頭
+    pose，不再追蹤物體的微小物理抖動。
+    """
+    global _S8_GRIPPER_EYE_OFFSET_EE, _S8_GRIPPER_TARGET_OFFSET_EE
+    if _S8_GRIPPER_CAMERA is None or _S8_EE_BODY_ID is None:
+        return
+    ee_pose_w = robot.data.body_pose_w[:, _S8_EE_BODY_ID]
+    ee_pos_w = ee_pose_w[:, :3]
+    rotation_w_ee = matrix_from_quat(ee_pose_w[:, 3:7])
+    fallback_eye_offset_w = ee_pos_w.new_tensor(
+        S8_GRIPPER_CAMERA_EYE_OFFSET_W
+    ).unsqueeze(0)
+    fallback_target_offset_w = ee_pos_w.new_tensor(
+        S8_GRIPPER_CAMERA_TARGET_OFFSET_W
+    ).unsqueeze(0)
+    camera_eye_w = ee_pos_w + fallback_eye_offset_w
+    camera_target_w = ee_pos_w + fallback_target_offset_w
+
+    # 只在第一幀用方塊對準；後續不再以方塊位置驅動鏡頭。
+    if _S8_GRIPPER_EYE_OFFSET_EE is None:
+        object_pos_w = (
+            _S8_TASK_OBJECT.data.root_state_w[:, :3]
+            if _S8_TASK_OBJECT is not None
+            else camera_target_w
+        )
+        ee_to_object_w = object_pos_w - ee_pos_w
+        horizontal_direction_w = ee_to_object_w.clone()
+        horizontal_direction_w[:, 2] = 0.0
+        horizontal_distance_m = torch.linalg.vector_norm(
+            horizontal_direction_w,
+            dim=1,
+            keepdim=True,
+        )
+        object_distance_m = torch.linalg.vector_norm(
+            ee_to_object_w,
+            dim=1,
+            keepdim=True,
+        )
+        object_is_near = torch.logical_and(
+            torch.logical_and(
+                torch.isfinite(object_pos_w).all(dim=1, keepdim=True),
+                object_distance_m < 0.35,
+            ),
+            horizontal_distance_m > 0.01,
+        )
+        safe_horizontal_direction_w = horizontal_direction_w / torch.clamp(
+            horizontal_distance_m,
+            min=1.0e-6,
+        )
+        # 鏡頭從 EE 朝方塊方向前移 5.5 cm，再往上 7.5 cm。
+        # 這會越過 wrist 外殼，模擬實體 eye-in-hand 支架的鏡頭位置。
+        tracked_eye_w = ee_pos_w + safe_horizontal_direction_w * 0.055
+        tracked_eye_w[:, 2] += 0.075
+        camera_eye_w = torch.where(object_is_near, tracked_eye_w, camera_eye_w)
+        camera_target_w = torch.where(
+            object_is_near,
+            object_pos_w,
+            camera_target_w,
+        )
+
+        rotation_ee_w = rotation_w_ee.transpose(1, 2)
+        _S8_GRIPPER_EYE_OFFSET_EE = torch.bmm(
+            rotation_ee_w,
+            (camera_eye_w - ee_pos_w).unsqueeze(-1),
+        ).squeeze(-1)
+        _S8_GRIPPER_TARGET_OFFSET_EE = torch.bmm(
+            rotation_ee_w,
+            (camera_target_w - ee_pos_w).unsqueeze(-1),
+        ).squeeze(-1)
+
+    camera_eye_w = ee_pos_w + torch.bmm(
+        rotation_w_ee,
+        _S8_GRIPPER_EYE_OFFSET_EE.unsqueeze(-1),
+    ).squeeze(-1)
+    camera_target_w = ee_pos_w + torch.bmm(
+        rotation_w_ee,
+        _S8_GRIPPER_TARGET_OFFSET_EE.unsqueeze(-1),
+    ).squeeze(-1)
+
+    _S8_GRIPPER_CAMERA.set_world_poses_from_view(
+        camera_eye_w,
+        camera_target_w,
+    )
+
+
+def create_s8_operator_viewports():
+    """用兩個額外 viewport 顯示側視與夾爪視角。
+
+    Camera prim 即使建立成功，不同 Isaac Sim/Kit 版本仍可能沒有
+    ``create_viewport_window``。這裡只讓自動開視窗失敗，不影響手機控制與
+    模擬主迴圈；使用者仍可從 Isaac Sim GUI 手動開 Viewport 2/3。
+    """
+    try:
+        from omni.kit.viewport.utility import create_viewport_window
+        from pxr import Sdf
+
+        side_window = create_viewport_window(
+            name="S8 Side View",
+            width=S8_OPERATOR_WINDOW_WIDTH,
+            height=S8_OPERATOR_WINDOW_HEIGHT,
+            position_x=S8_OPERATOR_WINDOW_X,
+            position_y=S8_OPERATOR_TOP_Y,
+            camera_path=Sdf.Path(S8_SIDE_CAMERA_PRIM_PATH),
+        )
+        gripper_window = create_viewport_window(
+            name="S8 Gripper View",
+            width=S8_OPERATOR_WINDOW_WIDTH,
+            height=S8_OPERATOR_WINDOW_HEIGHT,
+            position_x=S8_OPERATOR_WINDOW_X,
+            position_y=(
+                S8_OPERATOR_TOP_Y
+                + S8_OPERATOR_WINDOW_HEIGHT
+                + S8_OPERATOR_WINDOW_GAP
+            ),
+            camera_path=Sdf.Path(S8_GRIPPER_CAMERA_PRIM_PATH),
+        )
+        if side_window is None or gripper_window is None:
+            raise RuntimeError("create_viewport_window returned None")
+        print(
+            "S8 MULTIVIEW READY "
+            f"side={S8_SIDE_CAMERA_PRIM_PATH} "
+            f"gripper={S8_GRIPPER_CAMERA_PRIM_PATH} "
+            f"layout=left-stack-{S8_OPERATOR_WINDOW_WIDTH}x"
+            f"{S8_OPERATOR_WINDOW_HEIGHT}",
+            flush=True,
+        )
+        # 必須保留 Python reference，否則某些 Kit 版本會回收 viewport proxy。
+        return [side_window, gripper_window]
+    except Exception as exc:
+        print(
+            "S8 CAMERAS READY BUT AUTO VIEWPORT UNAVAILABLE "
+            f"error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        print(
+            "Open Isaac Sim Window > Viewports > Viewport 2/3, then select "
+            f"{S8_SIDE_CAMERA_PRIM_PATH} and {S8_GRIPPER_CAMERA_PRIM_PATH}.",
+            flush=True,
+        )
+        return []
 
 
 def write_rgb_png(path, rgb):
-    """Write an HWC uint8 RGB array as PNG using only the standard library."""
+    """把 HWC 排列的 uint8 RGB 影像寫成 PNG；不依賴 Pillow/OpenCV。"""
     height, width, channels = rgb.shape
     if channels != 3 or str(rgb.dtype) != "uint8":
         raise ValueError(f"expected HWC uint8 RGB, got shape={rgb.shape} dtype={rgb.dtype}")
@@ -199,7 +473,8 @@ def write_rgb_png(path, rgb):
 
 
 def capture_camera_smoke_frame(sim, camera, sim_dt, robot, target, task_object):
-    """Warm up the renderer, validate one RGB frame, write it, and return metrics."""
+    """相機冒煙測試：暖機、擷取一張影像、排除空白畫面，最後存成 PNG。"""
+    # 先跑幾個 frame，避免剛啟動 renderer 時讀到尚未完成的畫面。
     for _ in range(12):
         step_simulation(sim, robot, target, sim_dt, (task_object,))
         camera.update(sim_dt)
@@ -227,21 +502,32 @@ def capture_camera_smoke_frame(sim, camera, sim_dt, robot, target, task_object):
 
 
 def step_simulation(sim, robot, target, sim_dt, rigid_objects=()):
+    """推進一個 1/60 秒 physics step，是整支程式最核心的小循環。"""
+    # 錄製 hook 要在寫入本 step 的控制目標前取樣，才能對齊 observation/action。
     if _S3_BEFORE_STEP is not None:
         _S3_BEFORE_STEP(target)
+
+    # 1. 把本 step 的 joint position target 寫進 simulator。
     robot.set_joint_position_target(target)
     robot.write_data_to_sim()
     for rigid_object in rigid_objects:
         rigid_object.write_data_to_sim()
+    # 2. 真正讓 PhysX 向前走一個 dt。
     sim.step()
+
+    # 3. 把 PhysX 計算後的新狀態讀回 Isaac Lab 的 data buffer。
     robot.update(sim_dt)
     for rigid_object in rigid_objects:
         rigid_object.update(sim_dt)
+    # S-8 夾爪視角的 Camera prim 要在讀回最新 EE pose 後才移動。
+    update_s8_gripper_camera(robot)
+    # 相機也必須在 physics step 後更新，recorder 才能取得最新 RGB。
     if _S3_CAMERA is not None:
         _S3_CAMERA.update(sim_dt)
 
 
 def get_ee_pose_in_base(robot, ee_body_id):
+    """把末端執行器從 world frame 轉成 robot base frame 的 pose。"""
     root_pose_w = robot.data.root_pose_w
     ee_pose_w = robot.data.body_pose_w[:, ee_body_id]
     return subtract_frame_transforms(
@@ -253,6 +539,7 @@ def get_ee_pose_in_base(robot, ee_body_id):
 
 
 def get_position_jacobian_in_base(robot, ee_jacobian_index, arm_joint_ids):
+    """取得位置 Jacobian，並從 world frame 旋轉到 robot base frame。"""
     position_jacobian_w = robot.root_physx_view.get_jacobians()[
         :, ee_jacobian_index, 0:3, arm_joint_ids
     ]
@@ -261,6 +548,7 @@ def get_position_jacobian_in_base(robot, ee_jacobian_index, arm_joint_ids):
 
 
 def vector_list(tensor):
+    """把 GPU tensor 轉成可寫入 JSON 的 Python list；非有限值回傳 None。"""
     if tensor is None or not torch.isfinite(tensor).all().item():
         return None
     return tensor[0].detach().cpu().tolist()
@@ -280,6 +568,7 @@ def diagnostics(
     best_error_m,
     wall_time_s,
 ):
+    """整理一次 Cartesian 移動的驗收證據，供 log 與 ack 診斷使用。"""
     return {
         "command_frame": command_frame,
         "coordinates": "base",
@@ -299,7 +588,7 @@ def diagnostics(
 
 
 def replay_hdf5_episode(sim, robot, task_object, sim_dt, gripper_joint_id):
-    """Replay 30 Hz joint targets and require the S-4 success condition."""
+    """以 30 Hz 重播 HDF5 joint target，最後仍須通過 S-4 成功條件。"""
     try:
         import h5py
     except ModuleNotFoundError as exc:
@@ -330,6 +619,7 @@ def replay_hdf5_episode(sim, robot, task_object, sim_dt, gripper_joint_id):
         flush=True,
     )
     replay_target = None
+    # HDF5 是 30 Hz、physics 是 60 Hz，所以每筆 target 連續跑兩個 physics steps。
     for index, target_np in enumerate(joint_targets):
         replay_target = torch.as_tensor(
             target_np,
@@ -353,6 +643,7 @@ def replay_hdf5_episode(sim, robot, task_object, sim_dt, gripper_joint_id):
                 flush=True,
             )
 
+    # 重播完不能只說「程式跑完」；還要檢查方塊真的穩定留在目標區。
     success_latch = StableSuccess(args_cli.success_stable_steps)
     last_details = None
     for hold_step in range(240):
@@ -395,7 +686,16 @@ def replay_hdf5_episode(sim, robot, task_object, sim_dt, gripper_joint_id):
 
 
 def main():
-    global _S3_CAMERA, _S3_BEFORE_STEP, _S3_RECORDER
+    """建立場景並執行 60 Hz 控制主迴圈。"""
+    global _S3_CAMERA, _S3_BEFORE_STEP, _S3_RECORDER # 跟,main說這三個變數是定義在外面的共用變數，不是重新宣告的變數
+    global _S8_GRIPPER_CAMERA, _S8_EE_BODY_ID, _S8_TASK_OBJECT
+
+    # -------------------------------------------------------------------------
+    # [main 1/8] 啟動網路橋與 60 Hz 物理模擬
+    # camera smoke test／HDF5 replay 都是離線模式，不需要接受手機命令。
+    # -------------------------------------------------------------------------
+
+    #如果現在不是在重播HDF5或是測試相機，就啟動websocket準備接收手機命令
     if not args_cli.camera_smoke_test and not args_cli.replay_hdf5:
         bridge.start()
     sim_cfg = sim_utils.SimulationCfg(
@@ -412,6 +712,9 @@ def main():
     sim = sim_utils.SimulationContext(sim_cfg)
     sim.set_camera_view(eye=[0.8, 0.8, 0.6], target=[0.0, -0.19, 0.18])
 
+    # -------------------------------------------------------------------------
+    # [main 2/8] 建立固定場景：地面、燈光、支座、桌面、目標區、紅方塊、SO-101
+    # -------------------------------------------------------------------------
     ground_cfg = sim_utils.GroundPlaneCfg()
     ground_cfg.func("/World/GroundPlane", ground_cfg)
     light_cfg = sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
@@ -435,6 +738,7 @@ def main():
     )
     table_cfg.func("/World/S4Table", table_cfg, translation=TABLE_POS_W)
 
+    # 綠色 goal marker 只是視覺標記；真正的成功範圍由 GOAL_HALF_EXTENTS_M 判斷。
     goal_marker_cfg = sim_utils.CuboidCfg(
         size=(
             GOAL_HALF_EXTENTS_M[0] * 2.0,
@@ -449,6 +753,7 @@ def main():
         translation=(GOAL_POS_W[0], GOAL_POS_W[1], TABLE_TOP_Z_M + 0.001),
     )
 
+    # 紅色方塊是會受重力、摩擦與碰撞影響的 RigidObject。
     object_cfg = RigidObjectCfg(
         prim_path="/World/S4Object",
         spawn=sim_utils.CuboidCfg(
@@ -472,6 +777,7 @@ def main():
     )
     task_object = RigidObject(cfg=object_cfg)
 
+    # 載入 LeIsaac 提供的 SO-101 articulation 設定，再覆寫本任務的初始姿勢。
     robot_cfg = SO101_FOLLOWER_CFG.replace(prim_path="/World/SO101")
     robot_cfg.init_state.pos = ROBOT_BASE_POS_W
     # The LeIsaac asset defaults to a 180-degree yaw.  S4 places the table on
@@ -486,6 +792,9 @@ def main():
     }
     robot = Articulation(cfg=robot_cfg)
 
+    # -------------------------------------------------------------------------
+    # [main 3/8] 可選相機：只有 smoke test 或正式錄製時才建立，減少平常負擔。
+    # -------------------------------------------------------------------------
     s3_camera = None
     if args_cli.camera_smoke_test or args_cli.record_demos:
         camera_cfg = CameraCfg(
@@ -504,6 +813,47 @@ def main():
         s3_camera = Camera(cfg=camera_cfg)
         _S3_CAMERA = s3_camera
 
+    # S-8 多視角只服務操作者，不改動 S-3 錄影相機、HDF5 schema
+    # 或手機 WebSocket protocol。夾爪相機的 near clipping 較短，避免近距離
+    # 的夾爪／方塊被 5 cm 的預設裁切面消掉。
+    s8_side_camera = None
+    s8_gripper_camera = None
+    s8_viewport_windows = []
+    if args_cli.operator_multiview:
+        side_camera_cfg = CameraCfg(
+            prim_path=S8_SIDE_CAMERA_PRIM_PATH,
+            update_period=1.0 / 30.0,
+            height=args_cli.operator_camera_height,
+            width=args_cli.operator_camera_width,
+            data_types=["rgb"],
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=20.0,
+                focus_distance=0.35,
+                horizontal_aperture=20.955,
+                clipping_range=(0.02, 10.0),
+            ),
+        )
+        gripper_camera_cfg = CameraCfg(
+            prim_path=S8_GRIPPER_CAMERA_PRIM_PATH,
+            update_period=1.0 / 30.0,
+            height=args_cli.operator_camera_height,
+            width=args_cli.operator_camera_width,
+            data_types=["rgb"],
+            spawn=sim_utils.PinholeCameraCfg(
+                # 用較廣視角同時容納兩根手指與中間物體。
+                focal_length=12.0,
+                focus_distance=0.12,
+                horizontal_aperture=20.955,
+                clipping_range=(0.005, 2.0),
+            ),
+        )
+        s8_side_camera = Camera(cfg=side_camera_cfg)
+        s8_gripper_camera = Camera(cfg=gripper_camera_cfg)
+
+    # -------------------------------------------------------------------------
+    # [main 4/8] 第一次 reset，取得 joint/body ID，並讓初始姿勢先穩定下來。
+    # Isaac Lab 後續多數 API 使用整數 ID，所以在這裡由名稱查一次並保存。
+    # -------------------------------------------------------------------------
     sim.reset()
     robot.reset()
     task_object.reset()
@@ -513,6 +863,17 @@ def main():
         camera_targets = torch.tensor([S3_CAMERA_TARGET_W], device=sim.device)
         s3_camera.set_world_poses_from_view(camera_eyes, camera_targets)
         s3_camera.reset()
+    if s8_side_camera is not None:
+        side_camera_eyes = torch.tensor([S8_SIDE_CAMERA_EYE_W], device=sim.device)
+        side_camera_targets = torch.tensor(
+            [S8_SIDE_CAMERA_TARGET_W], device=sim.device
+        )
+        s8_side_camera.set_world_poses_from_view(
+            side_camera_eyes,
+            side_camera_targets,
+        )
+        s8_side_camera.reset()
+        s8_gripper_camera.reset()
     arm_joint_ids = [
         robot.joint_names.index(name) for name in CARTESIAN_JOINT_NAMES
     ]
@@ -520,9 +881,17 @@ def main():
     gripper_joint_limits = robot.data.soft_joint_pos_limits[
         :, gripper_joint_id, :
     ].clone()
+    wrist_flex_joint_id = robot.joint_names.index("wrist_flex")
+    wrist_roll_joint_id = robot.joint_names.index("wrist_roll")
+    wrist_body_id = robot.body_names.index("wrist")
+    orient_joint_ids = [wrist_flex_joint_id, wrist_roll_joint_id]
+    orient_joint_limits = robot.data.soft_joint_pos_limits[
+        :, orient_joint_ids, :
+    ].clone()
     ee_body_id = robot.body_names.index(EE_BODY_NAME)
     ee_jacobian_index = ee_body_id - 1
 
+    # default_joint_pos 是之後 reset_episode() 恢復機器人時的基準。
     default_joint_pos = robot.data.default_joint_pos.clone()
     default_joint_vel = robot.data.default_joint_vel.clone()
     robot.write_joint_state_to_sim(default_joint_pos, default_joint_vel)
@@ -544,6 +913,17 @@ def main():
         flush=True,
     )
 
+    # 必須等機器人完成初始姿態穩定後才校準 eye-in-hand。
+    # 若在上面 120 幀 settle 之前記錄 EE local offset，後續關節回到
+    # default pose 時會把鏡頭帶進 wrist 外殼。
+    if s8_gripper_camera is not None:
+        _S8_GRIPPER_CAMERA = s8_gripper_camera
+        _S8_EE_BODY_ID = ee_body_id
+        _S8_TASK_OBJECT = task_object
+        update_s8_gripper_camera(robot)
+        s8_viewport_windows = create_s8_operator_viewports()
+
+    # smoke test 模式只拍一張圖並退出，不進入控制主迴圈。
     if args_cli.camera_smoke_test:
         metrics = capture_camera_smoke_frame(
             sim,
@@ -559,6 +939,7 @@ def main():
         )
         return
 
+    # 保存方塊初始 pose/velocity，後續每個 episode 都回到完全相同的起點。
     object_initial_state = task_object.data.default_root_state.clone()
     reset_object_velocity = torch.zeros_like(object_initial_state[:, 7:])
     reset_object_staging_pose = object_initial_state[:, :7].clone()
@@ -569,6 +950,7 @@ def main():
     reset_object_staging_pose[:, 1] = TABLE_POS_W[1] + 1.0
     reset_object_staging_pose[:, 2] = TABLE_TOP_Z_M + 0.5
 
+    # replay 模式直接餵錄好的 joint target，不接受 WebSocket 命令。
     if args_cli.replay_hdf5:
         replay_hdf5_episode(
             sim,
@@ -579,6 +961,9 @@ def main():
         )
         return
 
+    # -------------------------------------------------------------------------
+    # [main 5/8] 建立 IK controller 與執行期狀態變數
+    # -------------------------------------------------------------------------
     initial_ee_pos_b, _ = get_ee_pose_in_base(robot, ee_body_id)
     initial_ee_pos_b = initial_ee_pos_b.clone()
     print("S4 ROBOT BODY POSES [world m]", flush=True)
@@ -595,6 +980,7 @@ def main():
             flush=True,
         )
     initial_arm_joint_pos = robot.data.joint_pos[:, arm_joint_ids].clone()
+    # position-driven 手臂在重力下可能有量測偏差；這個 offset 用來維持初始姿態。
     gravity_hold_offset = default_joint_pos[:, arm_joint_ids] - initial_arm_joint_pos
     arm_joint_limits = robot.data.soft_joint_pos_limits[:, arm_joint_ids, :].clone()
 
@@ -607,6 +993,8 @@ def main():
     ik_controller = DifferentialIKController(ik_cfg, num_envs=1, device=robot.device)
     ik_controller.reset()
 
+    # full_joint_target 是每個 physics step 實際寫入 SO-101 的六維關節目標。
+    # active 是目前唯一一筆正在執行的 Bridge request；None 代表閒置。
     full_joint_target = default_joint_pos.clone()
     held_gripper_target = default_joint_pos[:, gripper_joint_id].clone()
     active = None
@@ -630,12 +1018,31 @@ def main():
     jog_speed_m_s = None
     joint_jog_speed_deg_s = None
     gripper_jog_speed_deg_s = None
+    orient_start_joint_pos = None
+    orient_last_q_rel = [0.0, 0.0, 0.0, 1.0]
+    orient_was_clamped = False
+    pose_start_ee_pos_b = None
+    pose_command_ee_pos_b = None
+    pose_start_orient_joint_pos = None
+    pose_start_gripper_pos = None
+    pose_tool_forward_xy = (0.0, -1.0)
+    pose_last_p_rel_m = [0.0, 0.0, 0.0]
+    pose_last_q_rel = [0.0, 0.0, 0.0, 1.0]
+    pose_last_gripper_delta = 0.0
+    pose_was_workspace_clamped = False
+    pose_was_joint_clamped = False
+    pose_gripper_contact_count = 0
+    pose_gripper_stalled = False
+    pose_max_speed_m_s = POSE_MAX_SPEED_M_S
     episode_index = 0
     success_latch = StableSuccess(args_cli.success_stable_steps)
     success_display_remaining = 0
     self_test_countdown = 60 if args_cli.task_self_test else -1
     self_test_active = False
 
+    # -------------------------------------------------------------------------
+    # [main 6/8] 可選 HDF5 recorder 與每-step 錄製 hook
+    # -------------------------------------------------------------------------
     s3_recorder = None
     if args_cli.record_demos:
         try:
@@ -657,6 +1064,7 @@ def main():
         _S3_RECORDER = s3_recorder
 
     def s3_control_context():
+        """把目前 active command 轉成 recorder 要保存的五維 operator intent。"""
         operator_delta = torch.zeros(5, device=robot.device, dtype=torch.float32)
         source_ts_ms = -1
         source_seq = -1
@@ -710,6 +1118,7 @@ def main():
         return operator_delta, source_ts_ms, source_seq, command_code, step_code
 
     def s3_before_step(target):
+        """在每個 physics step 前收集 observation/action；recorder 內部降採樣到 30 Hz。"""
         if s3_recorder is None or not s3_recorder.active:
             return
         rgb = s3_camera.data.output["rgb"][0, ..., :3].detach().cpu()
@@ -743,7 +1152,12 @@ def main():
     if s3_recorder is not None:
         _S3_BEFORE_STEP = s3_before_step
 
+    # -------------------------------------------------------------------------
+    # [main 7/8] Episode reset：先移開方塊，再 reset 手臂，最後放回方塊。
+    # 不能同時瞬移手臂與方塊，否則接觸衝量可能把方塊彈飛。
+    # -------------------------------------------------------------------------
     def reset_episode(reason):
+        """結束目前 episode，恢復固定初始狀態並重新開放命令。"""
         nonlocal full_joint_target, held_gripper_target, episode_index
         nonlocal success_display_remaining, self_test_active
 
@@ -846,6 +1260,12 @@ def main():
         )
     bridge.ready.set()
     print("S4 PICK_PLACE SIM READY", flush=True)
+    if args_cli.operator_multiview:
+        print(
+            "S8 operator views enabled: main + side + gripper-follow; "
+            f"extra_viewports={len(s8_viewport_windows)}",
+            flush=True,
+        )
     print(f"S4 WS READY ws://{args_cli.ws_host}:{bridge.port}", flush=True)
     print("S4 initial EE base position [m]:", initial_list, flush=True)
     print("S4 object start world position [m]:", OBJECT_START_POS_W, flush=True)
@@ -892,7 +1312,12 @@ def main():
         flush=True,
     )
 
+    # -------------------------------------------------------------------------
+    # [main 8/8] 60 Hz 主迴圈
+    # 每一圈只走一條主要分支：Estop、成功展示、取新命令，或執行 active 命令。
+    # -------------------------------------------------------------------------
     while simulation_app.is_running():
+        # [主迴圈 1] 先讀最新的 EE 與方塊狀態，提供 App state 與成功判定使用。
         current_ee_pos_b, current_ee_quat_b = get_ee_pose_in_base(robot, ee_body_id)
         object_state_w = task_object.data.root_state_w[0]
         object_pos_w = object_state_w[:3].detach().cpu().tolist()
@@ -902,6 +1327,7 @@ def main():
             goal_pos=list(GOAL_POS_W),
         )
 
+        # [主迴圈 2] Estop 優先權最高：保持最後 actuator target，不再接受一般移動。
         if bridge.estop_event.is_set():
             if s3_recorder is not None and s3_recorder.active:
                 discarded = s3_recorder.discard("estop")
@@ -932,6 +1358,8 @@ def main():
             time.sleep(sim_dt)
             continue
 
+        # [主迴圈 3] task self-test 直接把方塊放到 goal，只測成功判定與 reset。
+        # 這不能當作機器人真的完成抓取的證據。
         if self_test_countdown >= 0:
             if self_test_countdown == 0:
                 self_test_pose = object_initial_state[:, :7].clone()
@@ -955,6 +1383,7 @@ def main():
             else:
                 self_test_countdown -= 1
 
+        # [主迴圈 4] 成功後保留畫面 90 steps（預設 1.5 秒），再自動 reset。
         if success_display_remaining > 0:
             step_simulation(sim, robot, full_joint_target, sim_dt, (task_object,))
             success_display_remaining -= 1
@@ -963,6 +1392,8 @@ def main():
             time.sleep(sim_dt)
             continue
 
+        # [主迴圈 5] 每個 physics sample 都檢查：位置、速度、角速度、夾爪已開。
+        # StableSuccess 只有在條件連續成立 30 steps 時才 latch 成功。
         sample_is_success = success_sample(
             object_pos=object_state_w[:3].detach().cpu().tolist(),
             goal_pos=GOAL_POS_W,
@@ -997,6 +1428,8 @@ def main():
                 bridge.clear_jog_stop()
                 bridge.clear_joint_jog_stop()
                 bridge.clear_gripper_jog_stop()
+                bridge.clear_orient_stop()
+                bridge.clear_pose_stop()
             if s3_recorder is not None:
                 saved = s3_recorder.finish_success()
                 if saved is not None:
@@ -1008,11 +1441,14 @@ def main():
                     )
             continue
 
+        # 方塊掉到桌面以下且目前沒有命令執行時，自動 reset；這不是成功。
         if active is None and object_pos_w[2] < FALLEN_OBJECT_Z_M:
             reset_episode("object_fallen")
             time.sleep(sim_dt)
             continue
 
+        # [主迴圈 6] 閒置時才從 Bridge queue 取下一筆命令。
+        # queue 容量為 1，因此系統不會堆積一長串過時動作。
         if active is None:
             request = bridge.take()
             if request is None:
@@ -1023,6 +1459,7 @@ def main():
                 bridge.finish(request, "rejected", "expired_before_execution")
                 continue
 
+            # 取出後放進 active；後續每圈都持續執行，直到完成、停止或失敗。
             active = request
             command_kind = request["message"]["type"]
             payload = request["message"]["payload"]
@@ -1031,6 +1468,7 @@ def main():
             gripper_contact_count = 0
             gripper_jog_stalled = False
             motion_started_at = time.monotonic()
+            # reset_scene 不需要 IK，收到後立刻執行完整 episode reset。
             if command_kind == "reset_scene":
                 reset_episode("manual")
                 bridge.finish(
@@ -1047,6 +1485,7 @@ def main():
                 active = None
                 time.sleep(sim_dt)
                 continue
+            # jog_start：按住期間以 m/s 連續更新 EE target，鬆開時由 jog_stop 結束。
             if command_kind == "jog_start":
                 axis = payload["axis"]
                 direction = payload["dir"]
@@ -1069,6 +1508,7 @@ def main():
                     f"frame={command_frame} start={vector_list(jog_start_ee_pos_b)}",
                     flush=True,
                 )
+            # move_delta：一次走固定距離；coarse=20 mm、fine=5 mm。
             elif command_kind == "move_delta":
                 axis = payload["axis"]
                 direction = payload["dir"]
@@ -1111,6 +1551,7 @@ def main():
                     f"trajectory_steps={trajectory_steps}",
                     flush=True,
                 )
+            # joint_jog_start／joint_delta：目前只允許直接調整 wrist_flex。
             elif command_kind == "joint_jog_start":
                 joint_name = payload["joint"]
                 direction = payload["dir"]
@@ -1163,6 +1604,84 @@ def main():
                     f"target_deg={math.degrees(goal_joint_pos[0].item()):.3f}",
                     flush=True,
                 )
+            # orient_start：手機相對旋轉只控制兩個 wrist joint。
+            # 原本的 XYZ／手腕按鍵／夾爪分支保持不變。
+            elif command_kind == "orient_start":
+                orient_start_joint_pos = robot.data.joint_pos[
+                    :, orient_joint_ids
+                ].clone()
+                full_joint_target[:, orient_joint_ids] = orient_start_joint_pos
+                orient_last_q_rel = [0.0, 0.0, 0.0, 1.0]
+                orient_was_clamped = False
+                bridge.update_state(ik="orienting", orient_deg=0.0)
+                print(
+                    f"[S4 ORIENT START] seq={active['seq']} "
+                    f"frame={payload['frame']} rate_hz={payload['rate_hz']} "
+                    f"gain={payload['gain']:.3f} "
+                    f"deadband_deg={payload['deadband_deg']:.3f} "
+                    f"smoothing={payload['smoothing']:.3f} "
+                    f"wrist_flex_deg="
+                    f"{math.degrees(orient_start_joint_pos[0, 0].item()):.3f} "
+                    f"wrist_roll_deg="
+                    f"{math.degrees(orient_start_joint_pos[0, 1].item()):.3f}",
+                    flush=True,
+                )
+            # pose_start：WebXR 位移控制 XYZ，同時沿用兩軸 wrist 映射，
+            # 拇指滑動則相對調整夾爪。三者共享同一份 latest-wins snapshot。
+            elif command_kind == "pose_start":
+                pose_start_ee_pos_b = current_ee_pos_b.clone()
+                pose_command_ee_pos_b = current_ee_pos_b.clone()
+                pose_start_wrist_pos_b, _ = get_ee_pose_in_base(
+                    robot,
+                    wrist_body_id,
+                )
+                wrist_to_gripper_xy = (
+                    pose_start_ee_pos_b[0, :2] - pose_start_wrist_pos_b[0, :2]
+                )
+                heading_norm = torch.linalg.vector_norm(wrist_to_gripper_xy).item()
+                if heading_norm >= 1.0e-6:
+                    pose_tool_forward_xy = tuple(
+                        (wrist_to_gripper_xy / heading_norm).detach().cpu().tolist()
+                    )
+                else:
+                    pose_tool_forward_xy = (0.0, -1.0)
+                pose_start_orient_joint_pos = robot.data.joint_pos[
+                    :, orient_joint_ids
+                ].clone()
+                pose_start_gripper_pos = robot.data.joint_pos[
+                    :, gripper_joint_id
+                ].clone()
+                held_gripper_target = pose_start_gripper_pos.clone()
+                full_joint_target[:, orient_joint_ids] = pose_start_orient_joint_pos
+                full_joint_target[:, gripper_joint_id] = held_gripper_target
+                pose_last_p_rel_m = [0.0, 0.0, 0.0]
+                pose_last_q_rel = [0.0, 0.0, 0.0, 1.0]
+                pose_last_gripper_delta = 0.0
+                pose_was_workspace_clamped = False
+                pose_was_joint_clamped = False
+                pose_gripper_contact_count = 0
+                pose_gripper_stalled = False
+                carrying = bridge.state_snapshot()["gripper"] == "close"
+                pose_max_speed_m_s = (
+                    POSE_CARRY_MAX_SPEED_M_S if carrying else POSE_MAX_SPEED_M_S
+                )
+                ik_controller.reset()
+                bridge.update_state(
+                    ik="pose_tracking",
+                    orient_deg=0.0,
+                    gripper_delta=0.0,
+                )
+                print(
+                    f"[S4 POSE START] seq={active['seq']} "
+                    f"frame={payload['frame']} rate_hz={payload['rate_hz']} "
+                    f"position_gain={POSE_POSITION_GAIN:.2f} "
+                    f"max_speed={pose_max_speed_m_s:.3f}m/s "
+                    f"profile={'carry' if carrying else 'free'} "
+                    f"tool_forward_xy={pose_tool_forward_xy} "
+                    f"start={vector_list(pose_start_ee_pos_b)}",
+                    flush=True,
+                )
+            # gripper_jog_start／gripper：控制開合，關閉時包含接觸停止保護。
             elif command_kind == "gripper_jog_start":
                 gripper_action = payload["action"]
                 step_name = payload["step"]
@@ -1217,6 +1736,8 @@ def main():
                 "jog_start": "jog_watchdog_timeout",
                 "joint_jog_start": "joint_jog_watchdog_timeout",
                 "gripper_jog_start": "gripper_jog_watchdog_timeout",
+                "orient_start": "orient_watchdog_timeout",
+                "pose_start": "pose_watchdog_timeout",
             }.get(command_kind, "execution_timeout")
             bridge.update_state(ik="no_solution")
             bridge.finish(active, "rejected", timeout_reason)
@@ -1228,6 +1749,412 @@ def main():
             active = None
             continue
 
+        # ---------------------------------------------------------------------
+        # [active 執行 A] WebXR 6-DoF：XYZ + 兩軸 wrist + 夾爪
+        # ---------------------------------------------------------------------
+        if command_kind == "pose_start":
+            current_ee_pos_b, current_ee_quat_b = get_ee_pose_in_base(
+                robot, ee_body_id
+            )
+            if bridge.pose_stop_event.is_set():
+                bridge.clear_pose_stop()
+                final_arm_joint_pos = robot.data.joint_pos[:, arm_joint_ids].clone()
+                final_orient_joint_pos = robot.data.joint_pos[
+                    :, orient_joint_ids
+                ].clone()
+                final_gripper_pos = robot.data.joint_pos[
+                    :, gripper_joint_id
+                ].clone()
+                full_joint_target[:, arm_joint_ids] = final_arm_joint_pos
+                full_joint_target[:, orient_joint_ids] = final_orient_joint_pos
+                held_gripper_target = final_gripper_pos.clone()
+                full_joint_target[:, gripper_joint_id] = held_gripper_target
+                rotation_vector = quaternion_xyzw_to_rotation_vector(
+                    pose_last_q_rel
+                )
+                details = {
+                    "frame": payload["frame"],
+                    "position_gain": POSE_POSITION_GAIN,
+                    "webxr_delta_m": list(pose_last_p_rel_m),
+                    "start_m": vector_list(pose_start_ee_pos_b),
+                    "end_m": vector_list(current_ee_pos_b),
+                    "actual_delta_m": vector_list(
+                        current_ee_pos_b - pose_start_ee_pos_b
+                    ),
+                    "phone_rotation_deg": math.degrees(
+                        math.sqrt(sum(value * value for value in rotation_vector))
+                    ),
+                    "gripper_delta": pose_last_gripper_delta,
+                    "workspace_clamped": pose_was_workspace_clamped,
+                    "joint_limit_clamped": pose_was_joint_clamped,
+                    "sim_steps": motion_step,
+                    "wall_time_s": time.monotonic() - motion_started_at,
+                }
+                bridge.update_state(
+                    ik=(
+                        "pose_clamped"
+                        if pose_was_workspace_clamped or pose_was_joint_clamped
+                        else "ok"
+                    ),
+                    ee_pos=vector_list(current_ee_pos_b),
+                    orient_deg=details["phone_rotation_deg"],
+                    gripper_delta=pose_last_gripper_delta,
+                )
+                bridge.finish(active, "ok", "pose_stopped", details)
+                print(f"S4 POSE STOP seq={active['seq']}", details, flush=True)
+                active = None
+                time.sleep(sim_dt)
+                continue
+
+            pose = bridge.pose_snapshot(active)
+            if pose is None:
+                time.sleep(sim_dt)
+                continue
+            pose_last_p_rel_m = pose["p_rel_m"]
+            pose_last_q_rel = pose["q_rel"]
+            pose_last_gripper_delta = pose["gripper_delta"]
+
+            mapped_delta_b = map_webxr_translation_to_tool_heading(
+                pose_last_p_rel_m,
+                pose_tool_forward_xy,
+                POSE_POSITION_GAIN,
+            )
+            requested_pose_target = pose_start_ee_pos_b + torch.tensor(
+                [mapped_delta_b],
+                device=robot.device,
+                dtype=pose_start_ee_pos_b.dtype,
+            )
+            workspace_lower = initial_ee_pos_b - WORKSPACE_RADIUS_M
+            workspace_upper = initial_ee_pos_b + WORKSPACE_RADIUS_M
+            desired_pose_target = torch.clamp(
+                requested_pose_target,
+                min=workspace_lower,
+                max=workspace_upper,
+            )
+            pose_workspace_clamped_now = not torch.allclose(
+                desired_pose_target,
+                requested_pose_target,
+                atol=1.0e-7,
+            )
+            pose_was_workspace_clamped = (
+                pose_was_workspace_clamped or pose_workspace_clamped_now
+            )
+
+            # Limit the target's travel per physics step.  The App also rejects
+            # a dropped/whipped phone, but this server-side limit remains the
+            # final safety boundary for delayed or bursty network updates.
+            target_delta = desired_pose_target - pose_command_ee_pos_b
+            target_delta_norm = torch.linalg.vector_norm(target_delta, dim=1)[0]
+            max_position_step_m = pose_max_speed_m_s * sim_dt
+            if target_delta_norm.item() > max_position_step_m:
+                target_delta = target_delta * (
+                    max_position_step_m / target_delta_norm.item()
+                )
+            pose_command_ee_pos_b = pose_command_ee_pos_b + target_delta
+
+            rotation_vector = quaternion_xyzw_to_rotation_vector(
+                pose_last_q_rel
+            )
+            flex_delta_rad = max(
+                -math.radians(ORIENT_MAX_FLEX_DELTA_DEG),
+                min(
+                    math.radians(ORIENT_MAX_FLEX_DELTA_DEG),
+                    ORIENT_FLEX_SIGN * rotation_vector[0],
+                ),
+            )
+            roll_delta_rad = max(
+                -math.radians(ORIENT_MAX_ROLL_DELTA_DEG),
+                min(
+                    math.radians(ORIENT_MAX_ROLL_DELTA_DEG),
+                    ORIENT_ROLL_SIGN * rotation_vector[1],
+                ),
+            )
+            requested_orient_target = pose_start_orient_joint_pos + torch.tensor(
+                [[flex_delta_rad, roll_delta_rad]],
+                device=robot.device,
+                dtype=pose_start_orient_joint_pos.dtype,
+            )
+            desired_orient_target = torch.clamp(
+                requested_orient_target,
+                min=orient_joint_limits[:, :, 0],
+                max=orient_joint_limits[:, :, 1],
+            )
+            pose_joint_clamped_now = not torch.allclose(
+                desired_orient_target,
+                requested_orient_target,
+                atol=1.0e-7,
+            )
+            pose_was_joint_clamped = (
+                pose_was_joint_clamped or pose_joint_clamped_now
+            )
+            orient_target_step = torch.clamp(
+                desired_orient_target - full_joint_target[:, orient_joint_ids],
+                min=-MAX_JOINT_DELTA_RAD,
+                max=MAX_JOINT_DELTA_RAD,
+            )
+            full_joint_target[:, orient_joint_ids] += orient_target_step
+
+            gripper_range = (
+                gripper_joint_limits[:, 1] - gripper_joint_limits[:, 0]
+            )
+            requested_gripper_target = (
+                pose_start_gripper_pos
+                + pose_last_gripper_delta * gripper_range
+            )
+            desired_gripper_target = torch.clamp(
+                requested_gripper_target,
+                min=gripper_joint_limits[:, 0],
+                max=gripper_joint_limits[:, 1],
+            )
+            gripper_opening = (
+                desired_gripper_target[0].item()
+                >= held_gripper_target[0].item()
+            )
+            gripper_speed_deg_s = (
+                GRIPPER_JOG_SPEED_DEG_S["fine"]
+                if gripper_opening
+                else GRIPPER_JOG_CLOSE_SPEED_DEG_S["fine"]
+            )
+            max_gripper_step_rad = math.radians(gripper_speed_deg_s) * sim_dt
+            held_gripper_target += torch.clamp(
+                desired_gripper_target - held_gripper_target,
+                min=-max_gripper_step_rad,
+                max=max_gripper_step_rad,
+            )
+
+            ik_controller.set_command(
+                pose_command_ee_pos_b,
+                ee_quat=current_ee_quat_b,
+            )
+            position_jacobian = get_position_jacobian_in_base(
+                robot, ee_jacobian_index, arm_joint_ids
+            )
+            current_arm_joint_pos = robot.data.joint_pos[:, arm_joint_ids]
+            desired_arm_joint_pos = ik_controller.compute(
+                current_ee_pos_b,
+                current_ee_quat_b,
+                position_jacobian,
+                current_arm_joint_pos,
+            )
+            if not (
+                torch.isfinite(desired_arm_joint_pos).all().item()
+                and torch.isfinite(current_ee_pos_b).all().item()
+            ):
+                bridge.update_state(ik="no_solution")
+                bridge.finish(active, "rejected", "pose_nonfinite_ik")
+                bridge.engage_estop()
+                full_joint_target = robot.data.joint_pos.clone()
+                print(
+                    f"[S4 POSE REJECT] seq={active['seq']} "
+                    "reason=pose_nonfinite_ik",
+                    flush=True,
+                )
+                active = None
+                continue
+
+            raw_joint_delta = desired_arm_joint_pos - current_arm_joint_pos
+            limited_joint_delta = torch.clamp(
+                raw_joint_delta,
+                min=-POSE_MAX_JOINT_DELTA_RAD,
+                max=POSE_MAX_JOINT_DELTA_RAD,
+            )
+            arm_joint_target = (
+                current_arm_joint_pos + gravity_hold_offset + limited_joint_delta
+            )
+            arm_joint_target = torch.clamp(
+                arm_joint_target,
+                min=arm_joint_limits[:, :, 0],
+                max=arm_joint_limits[:, :, 1],
+            )
+            full_joint_target[:, arm_joint_ids] = arm_joint_target
+            full_joint_target[:, gripper_joint_id] = held_gripper_target
+            pose_step_started_at = time.monotonic()
+            step_simulation(sim, robot, full_joint_target, sim_dt, (task_object,))
+
+            final_ee_pos_b, _ = get_ee_pose_in_base(robot, ee_body_id)
+            command_error_m = torch.linalg.vector_norm(
+                pose_command_ee_pos_b - final_ee_pos_b,
+                dim=1,
+            )[0].item()
+            if (
+                not math.isfinite(command_error_m)
+                or command_error_m > SAFETY_COMMAND_ERROR_M
+            ):
+                bridge.update_state(ik="no_solution")
+                bridge.finish(active, "rejected", "pose_tracking_safety_stop")
+                bridge.engage_estop()
+                full_joint_target = robot.data.joint_pos.clone()
+                print(
+                    f"[S4 POSE REJECT] seq={active['seq']} "
+                    "reason=pose_tracking_safety_stop "
+                    f"tracking_error_m={command_error_m}",
+                    flush=True,
+                )
+                active = None
+                continue
+
+            motion_step += 1
+            orient_deg = math.degrees(
+                math.sqrt(sum(value * value for value in rotation_vector))
+            )
+            if pose_last_gripper_delta > 0.02:
+                pose_gripper_state = "open"
+            elif pose_last_gripper_delta < -0.02:
+                pose_gripper_state = "close"
+            else:
+                pose_gripper_state = bridge.state_snapshot()["gripper"]
+            bridge.update_state(
+                ee_pos=vector_list(final_ee_pos_b),
+                gripper=pose_gripper_state,
+                ik=(
+                    "pose_clamped"
+                    if pose_workspace_clamped_now or pose_joint_clamped_now
+                    else "pose_tracking"
+                ),
+                orient_deg=orient_deg,
+                gripper_delta=pose_last_gripper_delta,
+            )
+            if motion_step % 30 == 0:
+                print(
+                    f"[S4 POSE] seq={active['seq']} step={motion_step} "
+                    f"webxr={pose_last_p_rel_m} "
+                    f"target={vector_list(pose_command_ee_pos_b)} "
+                    f"actual={vector_list(final_ee_pos_b)} "
+                    f"phone_deg={orient_deg:.2f} "
+                    f"gripper_delta={pose_last_gripper_delta:+.3f}",
+                    flush=True,
+                )
+            # Rendering three operator views can already consume most or all
+            # of a 1/60 s frame.  Only sleep for the unused part of the frame;
+            # a fixed extra sleep here made AR tracking unnecessarily laggy.
+            pose_step_remaining_s = sim_dt - (
+                time.monotonic() - pose_step_started_at
+            )
+            if pose_step_remaining_s > 0.0:
+                time.sleep(pose_step_remaining_s)
+            continue
+
+        # ---------------------------------------------------------------------
+        # [active 執行 B] 手機姿態控制 wrist_flex 與 wrist_roll
+        # ---------------------------------------------------------------------
+        if command_kind == "orient_start":
+            if bridge.orient_stop_event.is_set():
+                bridge.clear_orient_stop()
+                final_orient_joint_pos = robot.data.joint_pos[
+                    :, orient_joint_ids
+                ].clone()
+                full_joint_target[:, orient_joint_ids] = final_orient_joint_pos
+                rotation_vector = quaternion_xyzw_to_rotation_vector(
+                    orient_last_q_rel
+                )
+                details = {
+                    "frame": payload["frame"],
+                    "start_wrist_flex_deg": math.degrees(
+                        orient_start_joint_pos[0, 0].item()
+                    ),
+                    "end_wrist_flex_deg": math.degrees(
+                        final_orient_joint_pos[0, 0].item()
+                    ),
+                    "start_wrist_roll_deg": math.degrees(
+                        orient_start_joint_pos[0, 1].item()
+                    ),
+                    "end_wrist_roll_deg": math.degrees(
+                        final_orient_joint_pos[0, 1].item()
+                    ),
+                    "phone_rotation_deg": math.degrees(
+                        math.sqrt(sum(value * value for value in rotation_vector))
+                    ),
+                    "joint_limit_clamped": orient_was_clamped,
+                    "sim_steps": motion_step,
+                    "wall_time_s": time.monotonic() - motion_started_at,
+                }
+                bridge.update_state(
+                    ik="orient_clamped" if orient_was_clamped else "ok",
+                    orient_deg=details["phone_rotation_deg"],
+                )
+                bridge.finish(active, "ok", "orient_stopped", details)
+                print(
+                    f"S4 ORIENT STOP seq={active['seq']}",
+                    details,
+                    flush=True,
+                )
+                active = None
+                time.sleep(sim_dt)
+                continue
+
+            latest_q_rel = bridge.orient_snapshot(active)
+            if latest_q_rel is None:
+                time.sleep(sim_dt)
+                continue
+            orient_last_q_rel = latest_q_rel
+            rotation_vector = quaternion_xyzw_to_rotation_vector(latest_q_rel)
+            flex_delta_rad = max(
+                -math.radians(ORIENT_MAX_FLEX_DELTA_DEG),
+                min(
+                    math.radians(ORIENT_MAX_FLEX_DELTA_DEG),
+                    ORIENT_FLEX_SIGN * rotation_vector[0],
+                ),
+            )
+            roll_delta_rad = max(
+                -math.radians(ORIENT_MAX_ROLL_DELTA_DEG),
+                min(
+                    math.radians(ORIENT_MAX_ROLL_DELTA_DEG),
+                    ORIENT_ROLL_SIGN * rotation_vector[1],
+                ),
+            )
+            requested_orient_target = orient_start_joint_pos + torch.tensor(
+                [[flex_delta_rad, roll_delta_rad]],
+                device=robot.device,
+                dtype=orient_start_joint_pos.dtype,
+            )
+            desired_orient_target = torch.clamp(
+                requested_orient_target,
+                min=orient_joint_limits[:, :, 0],
+                max=orient_joint_limits[:, :, 1],
+            )
+            orient_is_clamped = not torch.allclose(
+                desired_orient_target,
+                requested_orient_target,
+                atol=1.0e-7,
+            )
+            orient_was_clamped = orient_was_clamped or orient_is_clamped
+            # 手機單幀旋轉即使很大，actuator target 也只能緩慢追上。
+            target_step = torch.clamp(
+                desired_orient_target - full_joint_target[:, orient_joint_ids],
+                min=-MAX_JOINT_DELTA_RAD,
+                max=MAX_JOINT_DELTA_RAD,
+            )
+            full_joint_target[:, orient_joint_ids] += target_step
+            full_joint_target[:, gripper_joint_id] = held_gripper_target
+            step_simulation(sim, robot, full_joint_target, sim_dt, (task_object,))
+            motion_step += 1
+            orient_deg = math.degrees(
+                math.sqrt(sum(value * value for value in rotation_vector))
+            )
+            bridge.update_state(
+                ik="orient_clamped" if orient_is_clamped else "orienting",
+                orient_deg=orient_deg,
+            )
+            if motion_step % 30 == 0:
+                current_orient_joint_pos = robot.data.joint_pos[
+                    :, orient_joint_ids
+                ]
+                print(
+                    f"[S4 ORIENT] seq={active['seq']} step={motion_step} "
+                    f"phone_deg={orient_deg:.2f} "
+                    f"wrist_flex_deg="
+                    f"{math.degrees(current_orient_joint_pos[0, 0].item()):.2f} "
+                    f"wrist_roll_deg="
+                    f"{math.degrees(current_orient_joint_pos[0, 1].item()):.2f}",
+                    flush=True,
+                )
+            time.sleep(sim_dt)
+            continue
+
+        # ---------------------------------------------------------------------
+        # [active 執行 B] wrist_flex 連續 jog
+        # 每個 step 依 deg/s 增加 target，直到 App 送 joint_jog_stop。
+        # ---------------------------------------------------------------------
         if command_kind == "joint_jog_start":
             if bridge.joint_jog_stop_event.is_set():
                 bridge.clear_joint_jog_stop()
@@ -1275,6 +2202,10 @@ def main():
             time.sleep(sim_dt)
             continue
 
+        # ---------------------------------------------------------------------
+        # [active 執行 B] wrist_flex 固定角度移動
+        # 使用線性插值走到目標，並要求誤差連續數步在容差內。
+        # ---------------------------------------------------------------------
         if command_kind == "joint_delta":
             alpha = min(float(motion_step + 1) / trajectory_steps, 1.0)
             command_joint_pos = start_joint_pos + alpha * (
@@ -1338,6 +2269,10 @@ def main():
             time.sleep(sim_dt)
             continue
 
+        # ---------------------------------------------------------------------
+        # [active 執行 C] 夾爪連續 jog
+        # 關閉時若 tracking error 持續變大，推測已接觸方塊並停止繼續硬夾。
+        # ---------------------------------------------------------------------
         if command_kind == "gripper_jog_start":
             if bridge.gripper_jog_stop_event.is_set():
                 bridge.clear_gripper_jog_stop()
@@ -1425,6 +2360,10 @@ def main():
             time.sleep(sim_dt)
             continue
 
+        # ---------------------------------------------------------------------
+        # [active 執行 D] 夾爪一次性 open/close
+        # 逐步插值到 0° 或 100°；close 遇到物體時可提前 contact stop。
+        # ---------------------------------------------------------------------
         if command_kind == "gripper":
 
             alpha = min(float(motion_step + 1) / args_cli.gripper_steps, 1.0)
@@ -1473,6 +2412,8 @@ def main():
             )
 
             if tracking_stalled:
+                # 目標仍在關閉、實際手指卻跟不上，代表碰到阻力。
+                # 不再追逐 hard-close，只保留極小 preload 以維持抓持。
                 # The position-driven finger is no longer following the closing
                 # command.  Treat that sustained lag as a contact-like stall and
                 # stop increasing the squeeze.  Keep only a small preload so a
@@ -1574,6 +2515,11 @@ def main():
             time.sleep(sim_dt)
             continue
 
+        # ---------------------------------------------------------------------
+        # [active 執行 E] Cartesian jog／move_delta 共用的 Differential IK 路徑
+        # 上面四種 joint/gripper 命令都已 continue，因此走到這裡的只剩
+        # jog_start 或 move_delta。
+        # ---------------------------------------------------------------------
         current_ee_pos_b, current_ee_quat_b = get_ee_pose_in_base(robot, ee_body_id)
         if command_kind == "jog_start":
             if bridge.jog_stop_event.is_set():
@@ -1650,6 +2596,7 @@ def main():
                 goal_ee_pos_b - start_ee_pos_b
             )
 
+        # IK 輸入是 base frame 下的目標位置；orientation 保持目前值不變。
         ik_controller.set_command(command_ee_pos_b, ee_quat=current_ee_quat_b)
         position_jacobian = get_position_jacobian_in_base(
             robot, ee_jacobian_index, arm_joint_ids
@@ -1674,6 +2621,7 @@ def main():
             active = None
             continue
 
+        # IK 輸出先做每-step 變化限制，再做 soft joint limit，最後才寫入 simulator。
         raw_joint_delta = desired_arm_joint_pos - current_arm_joint_pos
         limited_joint_delta = torch.clamp(
             raw_joint_delta,
@@ -1692,6 +2640,8 @@ def main():
 
         final_ee_pos_b, _ = get_ee_pose_in_base(robot, ee_body_id)
         bridge.update_state(ee_pos=vector_list(final_ee_pos_b))
+        # 這是即時安全誤差，不是 move_delta 的最終驗收誤差。
+        # 超過 10 cm 代表控制已嚴重偏離，立即 Estop。
         command_error_m = torch.linalg.vector_norm(
             command_ee_pos_b - final_ee_pos_b, dim=1
         )[0].item()
@@ -1719,6 +2669,7 @@ def main():
             time.sleep(sim_dt)
             continue
 
+        # move_delta 到達目標後還要連續穩定 MOVE_STABLE_STEPS，才回傳 completed。
         goal_error_m = torch.linalg.vector_norm(
             goal_ee_pos_b - final_ee_pos_b, dim=1
         )[0].item()
@@ -1780,14 +2731,19 @@ def main():
         time.sleep(sim_dt)
 
 
+# 只有直接執行這個檔案時才呼叫 main()；若被其他測試 import，不會自動跑模擬。
 if __name__ == "__main__":
     try:
-        main()
+        main() # 479
     except KeyboardInterrupt:
         print("A3 move_delta stopped by user.", flush=True)
     finally:
+        # 不論正常結束、Ctrl-C 或例外，都關閉 recorder、Bridge 與 Isaac Sim。
         _S3_BEFORE_STEP = None
         _S3_CAMERA = None
+        _S8_GRIPPER_CAMERA = None
+        _S8_EE_BODY_ID = None
+        _S8_TASK_OBJECT = None
         if _S3_RECORDER is not None:
             _S3_RECORDER.close()
             _S3_RECORDER = None
