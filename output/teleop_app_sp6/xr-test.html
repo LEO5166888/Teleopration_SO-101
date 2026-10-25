@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, user-scalable=no"
+    />
+    <title>WebXR 追蹤測試</title>
+    <style>
+      body {
+        font-family: -apple-system, "PingFang TC", sans-serif;
+        background: #111;
+        color: #eee;
+        margin: 0 auto;
+        padding: 16px;
+        max-width: 480px;
+      }
+      h1 {
+        font-size: 1.1rem;
+      }
+      button {
+        width: 100%;
+        padding: 14px;
+        font-size: 1rem;
+        border: none;
+        border-radius: 10px;
+        background: #2563eb;
+        color: #fff;
+        margin-bottom: 12px;
+      }
+      button:disabled {
+        background: #333;
+        color: #777;
+      }
+      .card {
+        background: #1c1c1c;
+        border-radius: 10px;
+        padding: 12px;
+        margin-bottom: 12px;
+      }
+      .card h2 {
+        font-size: 0.85rem;
+        color: #9ca3af;
+        margin: 0 0 8px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-family: ui-monospace, Menlo, monospace;
+        font-size: 1rem;
+      }
+      td {
+        padding: 3px 0;
+      }
+      td:last-child {
+        text-align: right;
+      }
+      .note {
+        font-size: 0.8rem;
+        color: #9ca3af;
+      }
+      .warn {
+        color: #fbbf24;
+      }
+      .ok {
+        color: #4ade80;
+      }
+      /* AR 開啟後這層疊在相機畫面上（dom-overlay） */
+      #overlay {
+        background: transparent;
+      }
+      #overlay.in-ar {
+        padding: 16px;
+      }
+      #overlay.in-ar .card {
+        background: rgba(0, 0, 0, 0.6);
+      }
+      #clutch {
+        width: 100%;
+        height: 120px;
+        border-radius: 12px;
+        background: rgba(124, 58, 237, 0.7);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 1.1rem;
+        touch-action: none;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      #clutch.held {
+        outline: 3px solid #facc15;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="overlay">
+      <h1>WebXR 追蹤測試（AR 對照組可行性）</h1>
+      <div class="card">
+        <h2>支援檢查</h2>
+        <table>
+          <tr>
+            <td>HTTPS</td>
+            <td id="secure">–</td>
+          </tr>
+          <tr>
+            <td>navigator.xr</td>
+            <td id="hasXr">–</td>
+          </tr>
+          <tr>
+            <td>immersive-ar</td>
+            <td id="arSupported">–</td>
+          </tr>
+        </table>
+      </div>
+
+      <button id="startBtn" disabled>開始 AR</button>
+
+      <div class="card">
+        <h2>手機位置（公分，以開始 AR 那一刻為原點）</h2>
+        <table>
+          <tr>
+            <td>x（右）</td>
+            <td id="px">–</td>
+          </tr>
+          <tr>
+            <td>y（上）</td>
+            <td id="py">–</td>
+          </tr>
+          <tr>
+            <td>z（後）</td>
+            <td id="pz">–</td>
+          </tr>
+          <tr>
+            <td>四元數 xyzw</td>
+            <td id="q">–</td>
+          </tr>
+          <tr>
+            <td>更新頻率</td>
+            <td id="fps">–</td>
+          </tr>
+          <tr>
+            <td>追蹤狀態</td>
+            <td id="track">–</td>
+          </tr>
+        </table>
+      </div>
+
+      <div id="clutch">按住：量相對位移</div>
+      <div class="card" style="margin-top: 12px">
+        <h2>按住期間的位移（公分）與轉角（度）</h2>
+        <table>
+          <tr>
+            <td>位移 dx, dy, dz</td>
+            <td id="dp">–</td>
+          </tr>
+          <tr>
+            <td>距離</td>
+            <td id="dist">–</td>
+          </tr>
+          <tr>
+            <td>轉角</td>
+            <td id="dang">–</td>
+          </tr>
+        </table>
+        <p class="note">
+          測法：按住紫色區，手機沿桌邊直直移動 20 cm 再放開，看距離是否接近
+          20。白牆、暗處容易飄。
+        </p>
+      </div>
+      <p id="msg" class="note"></p>
+    </div>
+
+    <script>
+      // 最小 WebXR 測試：確認這支手機＋瀏覽器拿不拿得到 6 自由度姿態、準不準、頻率多少。
+      // 跟 TidyBot++ 同一套 API：immersive-ar session、local 參考空間、dom-overlay 疊介面。
+      const $ = (id) => document.getElementById(id);
+      const fmt = (v, d = 1) => v.toFixed(d);
+      let session = null;
+      let latest = null; // {p:[x,y,z] 公尺, q:[x,y,z,w]}
+      let ref = null; // 按住那一刻的姿態
+      let frames = 0,
+        lastFpsT = performance.now();
+
+      function setMsg(text, cls = "note") {
+        $("msg").className = cls;
+        $("msg").textContent = text;
+      }
+
+      async function checkSupport() {
+        $("secure").textContent = window.isSecureContext ? "是" : "否";
+        $("secure").className = window.isSecureContext ? "ok" : "warn";
+        $("hasXr").textContent = navigator.xr ? "有" : "沒有";
+        $("hasXr").className = navigator.xr ? "ok" : "warn";
+        if (!navigator.xr) {
+          $("arSupported").textContent = "–";
+          setMsg(
+            "這個瀏覽器沒有 WebXR。iPhone 要用 XR Browser 類的 App 開；Android 用 Chrome。",
+            "warn",
+          );
+          return;
+        }
+        try {
+          const ok = await navigator.xr.isSessionSupported("immersive-ar");
+          $("arSupported").textContent = ok ? "支援" : "不支援";
+          $("arSupported").className = ok ? "ok" : "warn";
+          $("startBtn").disabled = !ok;
+        } catch (e) {
+          $("arSupported").textContent = "檢查失敗";
+          setMsg(e.message, "warn");
+        }
+      }
+
+      async function startAR() {
+        try {
+          session = await navigator.xr.requestSession("immersive-ar", {
+            requiredFeatures: ["local"],
+            optionalFeatures: ["dom-overlay"],
+            domOverlay: { root: $("overlay") },
+          });
+        } catch (e) {
+          setMsg(`開不了 AR：${e.message}`, "warn");
+          return;
+        }
+        $("overlay").classList.add("in-ar");
+        $("startBtn").disabled = true;
+        // WebXR 規定要有一個 WebGL 圖層才會跑畫格；我們不畫東西，每格清成透明讓相機畫面透出來
+        const canvas = document.createElement("canvas");
+        const gl = canvas.getContext("webgl", { xrCompatible: true });
+        session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+        const space = await session.requestReferenceSpace("local");
+        session.addEventListener("end", () => {
+          session = null;
+          $("overlay").classList.remove("in-ar");
+          $("startBtn").disabled = false;
+          setMsg("AR 已結束");
+        });
+        setMsg(
+          session.domOverlayState
+            ? "AR 開啟，介面疊在相機畫面上"
+            : "AR 開啟，但這個瀏覽器不支援把介面疊上去（dom-overlay）",
+        );
+
+        const onFrame = (t, frame) => {
+          session.requestAnimationFrame(onFrame);
+          const layer = session.renderState.baseLayer;
+          gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+          gl.clearColor(0, 0, 0, 0);
+          gl.clear(gl.COLOR_BUFFER_BIT);
+          const pose = frame.getViewerPose(space);
+          if (!pose) {
+            $("track").textContent = "追蹤遺失";
+            $("track").className = "warn";
+            return;
+          }
+          const { position: p, orientation: o } = pose.transform;
+          latest = { p: [p.x, p.y, p.z], q: [o.x, o.y, o.z, o.w] };
+          frames++;
+          show();
+          $("track").textContent = pose.emulatedPosition
+            ? "只有姿態（位置是估的）"
+            : "6 自由度";
+          $("track").className = pose.emulatedPosition ? "warn" : "ok";
+        };
+        session.requestAnimationFrame(onFrame);
+      }
+
+      // 轉角：兩個姿態之間差幾度，q 與 −q 視為同一個
+      function angleDeg(a, b) {
+        const dot = Math.abs(
+          a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3],
+        );
+        return ((2 * Math.acos(Math.min(1, dot))) / Math.PI) * 180;
+      }
+
+      function show() {
+        const { p, q } = latest;
+        $("px").textContent = fmt(p[0] * 100);
+        $("py").textContent = fmt(p[1] * 100);
+        $("pz").textContent = fmt(p[2] * 100);
+        $("q").textContent = q.map((v) => fmt(v, 2)).join(" ");
+        const now = performance.now();
+        if (now - lastFpsT > 1000) {
+          $("fps").textContent =
+            `${Math.round((frames * 1000) / (now - lastFpsT))} Hz`;
+          frames = 0;
+          lastFpsT = now;
+        }
+        if (ref) {
+          const d = p.map((v, i) => (v - ref.p[i]) * 100);
+          $("dp").textContent = d.map((v) => fmt(v)).join(", ");
+          $("dist").textContent = fmt(Math.hypot(...d));
+          $("dang").textContent = fmt(angleDeg(ref.q, q));
+        }
+      }
+
+      const clutch = $("clutch");
+      clutch.addEventListener("pointerdown", (e) => {
+        e.preventDefault();
+        if (!latest) {
+          setMsg("還沒有姿態資料，先按「開始 AR」", "warn");
+          return;
+        }
+        ref = { p: [...latest.p], q: [...latest.q] };
+        clutch.classList.add("held");
+        clutch.setPointerCapture?.(e.pointerId);
+      });
+      const release = () => {
+        ref = null;
+        clutch.classList.remove("held");
+      };
+      ["pointerup", "pointercancel"].forEach((t) =>
+        clutch.addEventListener(t, release),
+      );
+
+      $("startBtn").onclick = startAR;
+      checkSupport();
+    </script>
+  </body>
+</html>
+

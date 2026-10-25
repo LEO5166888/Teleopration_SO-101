@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>手機姿態 demo</title>
+    <style>
+      body {
+        font-family: -apple-system, "PingFang TC", sans-serif;
+        background: #111;
+        color: #eee;
+        margin: 0;
+        padding: 16px;
+        max-width: 480px;
+        margin: 0 auto;
+      }
+      h1 {
+        font-size: 1.1rem;
+      }
+      button {
+        width: 100%;
+        padding: 14px;
+        font-size: 1rem;
+        border: none;
+        border-radius: 10px;
+        background: #2563eb;
+        color: #fff;
+        margin-bottom: 12px;
+      }
+      .card {
+        background: #1c1c1c;
+        border-radius: 10px;
+        padding: 12px;
+        margin-bottom: 12px;
+      }
+      .card h2 {
+        font-size: 0.85rem;
+        color: #9ca3af;
+        margin: 0 0 8px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-family: ui-monospace, Menlo, monospace;
+        font-size: 1.05rem;
+      }
+      td {
+        padding: 4px 0;
+      }
+      td:last-child {
+        text-align: right;
+      }
+      .bar {
+        height: 6px;
+        background: #333;
+        border-radius: 3px;
+        margin: 2px 0 8px;
+        position: relative;
+      }
+      .bar i {
+        position: absolute;
+        top: 0;
+        height: 6px;
+        width: 6px;
+        border-radius: 3px;
+        background: #4ade80;
+        transform: translateX(-3px);
+      }
+      .note {
+        font-size: 0.8rem;
+        color: #9ca3af;
+      }
+      .warn {
+        color: #fbbf24;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>手機姿態 demo（K-1 第 6 站）</h1>
+    <button id="btn">允許感測器</button>
+    <p id="msg" class="note">
+      按上面的鈕。iPhone 一定要按；Android 通常按了就開始。
+    </p>
+
+    <div class="card">
+      <h2>Euler 角（DeviceOrientation 給的，度）</h2>
+      <table>
+        <tr>
+          <td>alpha（繞 z，水平方向角 0 到 360，不保證以北為 0）</td>
+          <td id="a">–</td>
+        </tr>
+        <tr>
+          <td>beta（繞 x，前後傾 −180 到 180）</td>
+          <td id="b">–</td>
+        </tr>
+        <tr>
+          <td>gamma（繞 y，左右傾 −90 到 90）</td>
+          <td id="g">–</td>
+        </tr>
+      </table>
+      <div class="bar"><i id="ba"></i></div>
+      <div class="bar"><i id="bb"></i></div>
+      <div class="bar"><i id="bg"></i></div>
+      <p class="note">把手機立起來再往後仰過垂直，看 beta、gamma、alpha 怎麼互相補償。</p>
+    </div>
+
+    <div class="card">
+      <h2>四元數（由上面三個角換算，順序 xyzw）</h2>
+      <table>
+        <tr>
+          <td>x</td>
+          <td id="qx">–</td>
+        </tr>
+        <tr>
+          <td>y</td>
+          <td id="qy">–</td>
+        </tr>
+        <tr>
+          <td>z</td>
+          <td id="qz">–</td>
+        </tr>
+        <tr>
+          <td>w</td>
+          <td id="qw">–</td>
+        </tr>
+        <tr>
+          <td class="note">平方和（應該是 1）</td>
+          <td id="qn" class="note">–</td>
+        </tr>
+      </table>
+      <p class="note">
+        同樣的動作，這四個數不會互補式地跳（可能整組變號，那是同一個朝向）。原地水平旋轉時只有 z 跟 w 在變。下面那格的參考方向是地球座標，跟這格不必相同。
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>感測器直接給的四元數（AbsoluteOrientationSensor，xyzw）</h2>
+      <table>
+        <tr>
+          <td colspan="2" id="sq" class="note">此瀏覽器不支援，或尚未允許</td>
+        </tr>
+      </table>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const rad = Math.PI / 180;
+
+      // DeviceOrientation 的 Euler 順序是 Z（alpha）、X'（beta）、Y''（gamma），內旋。
+      // 換成四元數：q = qz(alpha) · qx(beta) · qy(gamma)
+      function eulerToQuat(alpha, beta, gamma) {
+        const ca = Math.cos((alpha * rad) / 2),
+          sa = Math.sin((alpha * rad) / 2);
+        const cb = Math.cos((beta * rad) / 2),
+          sb = Math.sin((beta * rad) / 2);
+        const cg = Math.cos((gamma * rad) / 2),
+          sg = Math.sin((gamma * rad) / 2);
+        // 依 ZXY 內旋展開（W3C DeviceOrientation 規格附錄的公式）
+        const x = sb * ca * cg - cb * sa * sg;
+        const y = cb * ca * sg + sb * sa * cg;
+        const z = cb * sa * cg + sb * ca * sg;
+        const w = cb * ca * cg - sb * sa * sg;
+        return [x, y, z, w];
+      }
+
+      function show(id, v, digits = 1) {
+        $(id).textContent = v == null ? "–" : v.toFixed(digits);
+      }
+
+      function onOrient(e) {
+        if (e.alpha == null) {
+          $("msg").textContent = "有事件但沒有數值：這台裝置可能沒有陀螺儀。";
+          return;
+        }
+        $("msg").textContent = "收到資料，開始轉手機。";
+        show("a", e.alpha);
+        show("b", e.beta);
+        show("g", e.gamma);
+        $("ba").style.left = (e.alpha / 360) * 100 + "%";
+        $("bb").style.left = ((e.beta + 180) / 360) * 100 + "%";
+        $("bg").style.left = ((e.gamma + 90) / 180) * 100 + "%";
+        const q = eulerToQuat(e.alpha, e.beta, e.gamma);
+        show("qx", q[0], 3);
+        show("qy", q[1], 3);
+        show("qz", q[2], 3);
+        show("qw", q[3], 3);
+        show(
+          "qn",
+          q.reduce((s, v) => s + v * v, 0),
+          3,
+        );
+      }
+
+      function startSensorQuat() {
+        if (!("AbsoluteOrientationSensor" in window)) return;
+        try {
+          const s = new AbsoluteOrientationSensor({ frequency: 30 });
+          s.addEventListener("reading", () => {
+            const q = s.quaternion; // xyzw
+            $("sq").textContent = q.map((v) => v.toFixed(3)).join("  ");
+          });
+          s.addEventListener("error", (ev) => {
+            $("sq").textContent = "感測器錯誤：" + ev.error.name;
+          });
+          s.start();
+        } catch (err) {
+          $("sq").textContent = "無法啟動：" + err.message;
+        }
+      }
+
+      async function start() {
+        if (!window.isSecureContext) {
+          $("msg").innerHTML =
+            '<span class="warn">這頁不是 HTTPS，手機瀏覽器不會給感測器資料。用 serve_https.py 開。</span>';
+          return;
+        }
+        if (typeof DeviceOrientationEvent?.requestPermission === "function") {
+          const r = await DeviceOrientationEvent.requestPermission();
+          if (r !== "granted") {
+            $("msg").innerHTML = '<span class="warn">沒拿到權限。</span>';
+            return;
+          }
+        }
+        window.addEventListener("deviceorientation", onOrient);
+        startSensorQuat();
+        $("msg").textContent = "等資料中…（桌機沒有感測器，會一直等）";
+      }
+      $("btn").onclick = start;
+    </script>
+  </body>
+</html>
+

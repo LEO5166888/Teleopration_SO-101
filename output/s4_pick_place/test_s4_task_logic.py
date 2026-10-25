@@ -3,11 +3,14 @@ import unittest
 
 from s4_task_logic import (
     StableSuccess,
+    advance_tracking_safety,
+    filter_webxr_translation,
     inside_goal,
     map_webxr_translation_to_base,
     map_webxr_translation_to_tool_heading,
     quaternion_xyzw_to_rotation_vector,
     success_sample,
+    wrist_joint_deltas_rad,
 )
 
 
@@ -79,6 +82,31 @@ class S4TaskLogicTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             quaternion_xyzw_to_rotation_vector((0.0, 0.0, 0.0, 0.0))
 
+    def test_wrist_mapping_ignores_yaw(self):
+        angle = math.radians(30.0)
+        result = wrist_joint_deltas_rad(
+            (0.0, 0.0, math.sin(angle / 2.0), math.cos(angle / 2.0)),
+            gain=1.0,
+            deadband_deg=2.5,
+            smoothing=0.0,
+            previous_flex_rad=0.0,
+            previous_roll_rad=0.0,
+        )
+        self.assertEqual(result, (0.0, 0.0))
+
+    def test_wrist_mapping_applies_soft_deadband(self):
+        angle = math.radians(10.0)
+        flex, roll = wrist_joint_deltas_rad(
+            (math.sin(angle / 2.0), 0.0, 0.0, math.cos(angle / 2.0)),
+            gain=1.0,
+            deadband_deg=5.0,
+            smoothing=0.0,
+            previous_flex_rad=0.0,
+            previous_roll_rad=0.0,
+        )
+        self.assertAlmostEqual(flex, math.radians(5.0))
+        self.assertAlmostEqual(roll, 0.0)
+
     def test_webxr_translation_mapping(self):
         self.assertEqual(
             map_webxr_translation_to_base((0.10, 0.20, 0.30), gain=0.5),
@@ -88,6 +116,52 @@ class S4TaskLogicTests(unittest.TestCase):
         self.assertEqual(
             map_webxr_translation_to_base((0.0, 0.0, -0.10)),
             (0.0, 0.10, 0.0),
+        )
+
+    def test_webxr_translation_filter_rejects_stationary_drift(self):
+        self.assertEqual(
+            filter_webxr_translation(
+                (0.003, -0.004, 0.001),
+                (0.0, 0.0, 0.0),
+                deadband_m=0.004,
+                smoothing=0.0,
+            ),
+            (0.0, 0.0, 0.0),
+        )
+
+    def test_webxr_translation_filter_is_continuous_and_smoothed(self):
+        filtered = filter_webxr_translation(
+            (0.010, -0.006, 0.004),
+            (0.002, 0.0, 0.0),
+            deadband_m=0.004,
+            smoothing=0.75,
+        )
+        self.assertAlmostEqual(filtered[0], 0.003)
+        self.assertAlmostEqual(filtered[1], -0.0005)
+        self.assertAlmostEqual(filtered[2], 0.0)
+
+    def test_webxr_translation_filter_rejects_bad_input(self):
+        with self.assertRaises(ValueError):
+            filter_webxr_translation((0.0, 0.0), (0.0, 0.0, 0.0))
+        with self.assertRaises(ValueError):
+            filter_webxr_translation(
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0),
+                smoothing=1.0,
+            )
+
+    def test_tracking_safety_requires_consecutive_errors(self):
+        streak = 0
+        for _ in range(14):
+            tripped, streak = advance_tracking_safety(0.11, 0.10, streak, 15)
+            self.assertFalse(tripped)
+        tripped, streak = advance_tracking_safety(0.11, 0.10, streak, 15)
+        self.assertTrue(tripped)
+
+    def test_tracking_safety_resets_after_recovery(self):
+        self.assertEqual(
+            advance_tracking_safety(0.01, 0.10, 7, 15),
+            (False, 0),
         )
 
     def test_webxr_translation_mapping_rejects_bad_input(self):

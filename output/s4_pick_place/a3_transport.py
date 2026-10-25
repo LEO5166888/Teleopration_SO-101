@@ -226,11 +226,13 @@ def validate_orient_update(payload):
 
 def validate_pose_start(payload):
     required = {"frame", "rate_hz", "gain", "deadband_deg", "smoothing"}
-    if set(payload) != required:
+    if not required.issubset(payload) or not set(payload).issubset(required | {"control_mode"}):
         return (
             "invalid_pose_start",
             "payload must contain frame, rate_hz, gain, deadband_deg, and smoothing",
         )
+    if payload.get("control_mode", "translation") not in ("translation", "wrist"):
+        return "invalid_pose_control_mode", "control_mode must be translation or wrist"
     if payload["frame"] != "webxr_local":
         return "invalid_pose_frame", "frame must be webxr_local"
     if type(payload["rate_hz"]) is not int or payload["rate_hz"] != 30:

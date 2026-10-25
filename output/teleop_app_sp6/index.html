@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="theme-color" content="#111" />
+    <title>Teleop App v0</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <!-- 版面：一個螢幕放得下，不用捲動。上：狀態與模式；中：目前模式的控制；下：狀態列、工具、急停 -->
+    <header class="top">
+      <div class="top-left">
+        <h1>Teleop</h1>
+        <span id="status" class="status disconnected">未連</span>
+      </div>
+      <span id="gate" class="gate blocked">未連線</span>
+    </header>
+
+    <!-- 連上後自動收起，斷線時自動展開 -->
+    <details id="conn" class="conn" open>
+      <summary>連線設定</summary>
+      <input
+        id="serverUrl"
+        type="text"
+        inputmode="url"
+        autocapitalize="off"
+        placeholder="ws://192.168.x.x:8765"
+      />
+      <div class="row">
+        <button id="connectBtn">連線</button>
+        <button id="disconnectBtn" class="secondary" disabled>斷線</button>
+      </div>
+    </details>
+
+    <!-- 模式分頁：一次只顯示一種 -->
+    <nav class="tabs" role="tablist">
+      <button class="tab" data-tab="buttons" role="tab">按鈕</button>
+      <button class="tab" data-tab="gyro" role="tab">陀螺儀</button>
+      <button class="tab" data-tab="ar" role="tab">AR</button>
+    </nav>
+
+    <main class="controls">
+      <!-- 方向鍵：按鈕與陀螺儀模式共用（陀螺儀只控轉向，平移仍用方向鍵） -->
+      <section class="pad" data-modes="buttons gyro">
+        <div class="dpad">
+          <span></span>
+          <button class="hold move" data-axis="y" data-dir="-1" disabled>
+            前<small>y−</small>
+          </button>
+          <span></span>
+          <button class="hold move" data-axis="x" data-dir="1" disabled>
+            左<small>x＋</small>
+          </button>
+          <span class="dpad-center"></span>
+          <button class="hold move" data-axis="x" data-dir="-1" disabled>
+            右<small>x−</small>
+          </button>
+          <span></span>
+          <button class="hold move" data-axis="y" data-dir="1" disabled>
+            後<small>y＋</small>
+          </button>
+          <span></span>
+        </div>
+        <div class="zcol">
+          <button class="hold move" data-axis="z" data-dir="1" disabled>
+            上<small>z＋</small>
+          </button>
+          <button class="hold move" data-axis="z" data-dir="-1" disabled>
+            下<small>z−</small>
+          </button>
+        </div>
+      </section>
+
+      <!-- 按鈕模式：手腕＋夾爪一排 -->
+      <div class="row act" data-modes="buttons">
+        <button class="hold wrist" data-dir="1" disabled>
+          腕↑<small>flex＋</small>
+        </button>
+        <button class="hold wrist" data-dir="-1" disabled>
+          腕↓<small>flex−</small>
+        </button>
+        <button class="hold grip" data-action="open" disabled>
+          開<small>夾爪</small>
+        </button>
+        <button class="hold grip" data-action="close" disabled>
+          關<small>夾爪</small>
+        </button>
+      </div>
+
+      <!-- 陀螺儀模式：手腕改用「按住轉手機」，夾爪照舊 -->
+      <div class="row act" data-modes="gyro">
+        <button id="sensorBtn" class="secondary sensor">
+          啟用陀螺儀<small>iPhone 會詢問權限</small>
+        </button>
+        <button id="orientBtn" class="hold orient" disabled hidden>
+          按住轉手機<small id="orientInfo">未啟用</small>
+        </button>
+        <button class="hold grip" data-action="open" disabled>
+          開<small>夾爪</small>
+        </button>
+        <button class="hold grip" data-action="close" disabled>
+          關<small>夾爪</small>
+        </button>
+      </div>
+
+      <!-- AR 模式：一顆大按鈕進入全螢幕 AR -->
+      <section class="ar-panel" data-modes="ar">
+        <button id="arStartBtn" class="ar-start" disabled>
+          進入 AR<small id="arSupport">檢查中…</small>
+        </button>
+        <p class="hint">
+          按住畫面：手機移動帶動整隻手臂；夾爪用畫面下方的按鈕。iPhone 請用
+          XRViewer 開這頁，Android 用 Chrome。
+        </p>
+      </section>
+
+      <div id="stateBar" class="state-bar">尚未收到 state</div>
+
+      <div class="row tools">
+        <button id="modeBtn" class="mode" disabled>微調</button>
+        <button id="resetSceneBtn" class="secondary" disabled>重置場景</button>
+        <button id="settingsBtn" class="secondary">⚙ 設定</button>
+      </div>
+    </main>
+
+    <!-- 急停固定在最下方：任何模式都看得到、拇指按得到；急停中才出現解除鈕 -->
+    <footer class="estop-bar">
+      <button id="estopBtn" class="estop" disabled>急停 STOP</button>
+      <button id="estopResetBtn" class="estop-reset" disabled hidden>
+        解除急停
+      </button>
+    </footer>
+
+    <!-- 設定：平常收起來 -->
+    <dialog id="settings">
+      <div class="sheet-head">
+        <h2>設定</h2>
+        <button id="settingsCloseBtn" class="secondary">完成</button>
+      </div>
+
+      <h3>姿態參數（陀螺儀與 AR 的轉向，按下時讀取）</h3>
+      <label
+        >增益 gain
+        <input
+          id="orientGain"
+          type="number"
+          value="0.7"
+          min="0.1"
+          max="2"
+          step="0.1"
+      /></label>
+      <label
+        >死區（度）
+        <input
+          id="orientDeadband"
+          type="number"
+          value="2.5"
+          min="0"
+          max="15"
+          step="0.5"
+      /></label>
+      <label
+        >平滑 smoothing
+        <input
+          id="orientSmoothing"
+          type="number"
+          value="0.3"
+          min="0"
+          max="0.95"
+          step="0.05"
+      /></label>
+
+      <h3>訊息紀錄與測試</h3>
+      <div class="row">
+        <button id="helloBtn" class="secondary" disabled>送 hello</button>
+        <button id="testBtn" class="secondary" disabled>送 test</button>
+        <button id="clearBtn" class="secondary">清空紀錄</button>
+      </div>
+      <label class="toggle">
+        <input id="showHighFreq" type="checkbox" />
+        顯示高頻訊息（keepalive、orient_update、pose_update、state）
+      </label>
+      <ul id="log"></ul>
+    </dialog>
+
+    <!-- AR 模式開啟後只顯示這一層（WebXR dom-overlay），疊在相機畫面上 -->
+    <div id="arOverlay" hidden>
+      <div class="ar-top">
+        <span id="arInfo">AR 未開始</span>
+        <button id="arEstopResetBtn" class="estop-reset" disabled>
+          解除急停
+        </button>
+        <button id="arResetSceneBtn" class="secondary" disabled>
+          重置場景
+        </button>
+        <button id="arExitBtn" class="secondary">結束 AR</button>
+      </div>
+      <button id="arEstopBtn" class="estop">急停 STOP</button>
+      <div class="ar-control-modes" role="group" aria-label="AR 控制模式">
+        <button type="button" data-ar-control="translation" aria-pressed="true">平移</button>
+        <button type="button" data-ar-control="wrist" aria-pressed="false">手腕</button>
+      </div>
+      <div id="arModeHint" class="ar-mode-hint">平移：只控制位置，忽略手機傾斜</div>
+      <button id="arClutch" class="hold ar-clutch" disabled>
+        <span id="arClutchLabel">按住平移</span>
+        <small id="arClutchHint">夾爪用下方按鈕，可以跟這裡同時按</small>
+        <small id="arReadout"></small>
+      </button>
+      <div class="row ar-grip">
+        <button class="hold ar-grip-btn" data-action="open" disabled>
+          夾爪 開
+        </button>
+        <button class="hold ar-grip-btn" data-action="close" disabled>
+          夾爪 關
+        </button>
+      </div>
+    </div>
+
+    <script src="ar_control_modes.js?v=explicit-v2"></script>
+    <script src="app.js?v=explicit-v2"></script>
+  </body>
+</html>
+

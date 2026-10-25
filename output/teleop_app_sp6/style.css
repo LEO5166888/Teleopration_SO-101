@@ -1,0 +1,551 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --bg: #111;
+  --panel: #1c1c1c;
+  --line: #2a2a2a;
+  --text: #eee;
+  --muted: #9ca3af;
+  --blue: #2563eb;
+  --btn: #374151;
+  --btn-held: #facc15;
+  --ok: #16a34a;
+  --bad: #dc2626;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+/* 整頁一個螢幕高、不捲動：上中下三段，中間（控制區）吃掉剩下的高度 */
+html,
+body {
+  height: 100%;
+}
+body {
+  font-family: -apple-system, "PingFang TC", "Noto Sans TC", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: calc(8px + env(safe-area-inset-top)) 12px
+    calc(10px + env(safe-area-inset-bottom));
+  max-width: 520px;
+  margin: 0 auto;
+  overflow: hidden;
+  -webkit-text-size-adjust: 100%;
+}
+
+/* ===== 頂列：標題、連線狀態、動作閘門 ===== */
+.top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.top-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+h1 {
+  font-size: 1.1rem;
+}
+.status {
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-size: 0.8rem;
+}
+.status.disconnected {
+  background: #555;
+}
+.status.connected {
+  background: #1a7f37;
+}
+.status.reconnecting {
+  background: #b45309;
+}
+.gate {
+  padding: 4px 10px;
+  border-radius: 8px;
+  font-size: 0.8rem;
+  background: var(--panel);
+  white-space: nowrap;
+}
+.gate.ok {
+  color: #4ade80;
+}
+.gate.blocked {
+  color: #fbbf24;
+}
+
+/* ===== 連線設定（可收合） ===== */
+details {
+  background: var(--panel);
+  border-radius: 10px;
+  padding: 8px 10px;
+}
+summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--muted);
+  list-style: none;
+}
+summary::before {
+  content: "▸ ";
+}
+details[open] summary::before {
+  content: "▾ ";
+}
+details[open] summary {
+  margin-bottom: 8px;
+}
+#serverUrl {
+  width: 100%;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid #444;
+  background: #111;
+  color: var(--text);
+  font-size: 1rem;
+  margin-bottom: 8px;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+}
+
+/* ===== 按鈕通則 ===== */
+button {
+  flex: 1;
+  padding: 12px;
+  font-size: 1rem;
+  border: none;
+  border-radius: 10px;
+  background: var(--blue);
+  color: #fff;
+  -webkit-tap-highlight-color: transparent;
+}
+button:disabled {
+  background: #2a2a2a;
+  color: #666;
+}
+button.secondary {
+  background: #333;
+}
+button.secondary:disabled {
+  background: #222;
+}
+#disconnectBtn:not(:disabled) {
+  background: #7f1d1d;
+}
+
+/* ===== 模式分頁 ===== */
+.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 10px;
+  background: var(--panel);
+}
+.tab {
+  padding: 8px;
+  font-size: 0.95rem;
+  background: transparent;
+  color: var(--muted);
+}
+.tab.active {
+  background: #374151;
+  color: #fff;
+  font-weight: 600;
+}
+
+/* ===== 控制區：吃掉剩下的高度；方向鍵跟著縮放 ===== */
+.controls {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* 按住型按鈕：不讓瀏覽器把長按當捲動／選字／叫出選單 */
+.hold {
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  background: var(--btn);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  font-size: 1.25rem;
+  font-weight: 600;
+}
+.hold small,
+button small {
+  display: block;
+  font-size: 0.6rem;
+  font-weight: 400;
+  color: var(--muted);
+}
+.hold:disabled small {
+  color: #555;
+}
+.hold.held {
+  background: #4b5563;
+  outline: 3px solid var(--btn-held);
+  outline-offset: -3px;
+}
+
+/* 方向盤：十字 3×3 ＋ 右側上下，高度隨螢幕伸縮 */
+.pad {
+  flex: 1;
+  min-height: 120px;
+  display: flex;
+  gap: 8px;
+}
+.dpad {
+  flex: 3;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+/* 方向鍵可以縮到比內距還矮，螢幕小或連線設定展開時才不會疊到下一排 */
+.dpad .hold,
+.zcol .hold {
+  min-height: 0;
+  padding: 0;
+}
+.dpad-center {
+  border-radius: 50%;
+  background: #222;
+  margin: 25%;
+}
+.zcol {
+  flex: 1.1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.zcol .hold {
+  flex: 1;
+  background: #3b4a5e;
+}
+
+/* 手腕、夾爪、陀螺儀：一排 */
+.act {
+  height: 72px;
+  flex: 0 0 auto;
+}
+.act button {
+  padding: 6px;
+  font-size: 1.1rem;
+}
+.wrist {
+  background: #4b5563;
+}
+.grip {
+  background: #0f766e;
+}
+.sensor {
+  flex: 2;
+  font-size: 0.95rem;
+}
+.orient {
+  flex: 2;
+  background: #7c3aed;
+}
+
+/* AR 分頁：一顆大按鈕＋一行說明 */
+.ar-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+}
+.ar-start {
+  flex: 1;
+  font-size: 1.4rem;
+  font-weight: 700;
+  background: #0e7490;
+}
+.ar-start small {
+  margin-top: 6px;
+  font-size: 0.8rem;
+}
+.hint {
+  font-size: 0.8rem;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+/* 狀態列：最多兩行，不截斷 */
+.state-bar {
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-family: ui-monospace, Menlo, monospace;
+  line-height: 1.4;
+}
+
+.tools button {
+  padding: 10px 6px;
+  font-size: 0.9rem;
+}
+.mode {
+  background: #6d28d9;
+}
+
+/* ===== 急停：固定在最下方，整條寬 ===== */
+.estop-bar {
+  display: flex;
+  gap: 8px;
+}
+button.estop {
+  flex: 3;
+  width: 100%;
+  padding: 18px;
+  font-size: 1.25rem;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  background: var(--bad);
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+button.estop:disabled {
+  background: #2a2a2a;
+}
+button.estop:active:not(:disabled) {
+  background: #991b1b;
+}
+.estop-reset {
+  flex: 2;
+  background: #b45309;
+  font-weight: 700;
+}
+.estop-reset:disabled {
+  background: #2a2a2a;
+}
+
+/* ack 回饋：綠閃＝ok，紅閃＝rejected */
+button.flash-ok {
+  animation: flashOk 0.4s;
+}
+button.flash-bad {
+  animation: flashBad 0.6s;
+}
+@keyframes flashOk {
+  50% {
+    background: var(--ok);
+  }
+}
+@keyframes flashBad {
+  50% {
+    background: var(--bad);
+  }
+}
+
+/* ===== 設定（全螢幕對話框） ===== */
+#settings {
+  width: 100%;
+  max-width: 520px;
+  height: 100dvh;
+  max-height: 100dvh;
+  margin: 0 auto;
+  padding: calc(12px + env(safe-area-inset-top)) 14px
+    calc(14px + env(safe-area-inset-bottom));
+  border: none;
+  background: var(--bg);
+  color: var(--text);
+}
+#settings::backdrop {
+  background: rgba(0, 0, 0, 0.6);
+}
+.sheet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.sheet-head h2 {
+  font-size: 1.1rem;
+}
+.sheet-head button {
+  flex: 0 0 auto;
+  padding: 8px 16px;
+}
+#settings h3 {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin: 14px 0 8px;
+}
+#settings label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+#settings input[type="number"] {
+  width: 90px;
+  padding: 6px;
+  border-radius: 6px;
+  border: 1px solid #444;
+  background: #111;
+  color: var(--text);
+  font-size: 1rem;
+}
+#settings .row button {
+  padding: 8px;
+  font-size: 0.85rem;
+}
+#settings .toggle {
+  justify-content: flex-start;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+/* ===== 紀錄 ===== */
+#log {
+  list-style: none;
+  font-size: 0.72rem;
+  margin-top: 8px;
+}
+#log li {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+}
+#log .dir {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 0.7rem;
+}
+#log .dir.out {
+  background: #1e3a8a;
+}
+#log .dir.in {
+  background: #14532d;
+}
+#log .dir.sys {
+  background: #57534e;
+}
+#log .time {
+  flex: 0 0 auto;
+  color: #888;
+}
+#log code {
+  word-break: break-all;
+}
+
+/* ===== AR overlay：開啟後整頁只剩這一層疊在相機畫面上 ===== */
+#arOverlay:not([hidden]) {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: calc(10px + env(safe-area-inset-top)) 12px
+    calc(12px + env(safe-area-inset-bottom));
+  background: transparent;
+}
+#arOverlay.opaque {
+  background: var(--bg);
+}
+.ar-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #fff;
+  font-size: 0.85rem;
+  text-shadow: 0 1px 2px #000;
+}
+.ar-top span {
+  flex: 1;
+}
+.ar-top button {
+  flex: 0 0 auto;
+  padding: 8px 12px;
+}
+#arOverlay .estop {
+  flex: 0 0 auto;
+}
+.ar-control-modes {
+  display: flex;
+  gap: 10px;
+}
+.ar-control-modes button {
+  flex: 1;
+  min-height: 48px;
+  background: #262d35;
+  border: 2px solid transparent;
+  color: #d4dfed;
+}
+.ar-control-modes button[aria-pressed="true"] {
+  background: #2563eb;
+  border: 2px solid #9ecbff;
+  color: white;
+}
+.ar-mode-hint { font-size: 14px; color: #d4dfed; text-align: center; }
+.ar-clutch {
+  flex: 1;
+  background: rgba(14, 116, 144, 0.45);
+  font-size: 1.1rem;
+}
+.ar-clutch small {
+  font-size: 0.75rem;
+  color: #e5e7eb;
+}
+.ar-clutch:disabled {
+  background: rgba(42, 42, 42, 0.6);
+}
+.ar-grip {
+  flex: 0 0 auto;
+  height: 84px;
+}
+.ar-grip-btn {
+  background: rgba(15, 118, 110, 0.85);
+}
+.ar-grip-btn:disabled {
+  background: rgba(42, 42, 42, 0.6);
+}
+.ar-clutch.held {
+  background: rgba(14, 116, 144, 0.7);
+}
+
+/* ===== 橫拿：方向盤在左，其餘在右 ===== */
+@media (orientation: landscape) and (min-width: 640px) {
+  body {
+    max-width: 900px;
+  }
+  .controls {
+    display: grid;
+    grid-template-columns: 3fr 2fr;
+    grid-auto-rows: min-content;
+  }
+  .pad,
+  .ar-panel {
+    grid-row: span 4;
+    max-height: none;
+  }
+}
+

@@ -27,7 +27,8 @@
         -> reset_episode()
         -> 最後再看各種 command_kind 的細節
 
-本次加入的是教學註解，不改變原有控制流程與參數。
+目前使用原始 base-frame 控制：WebXR 位移映射到 robot base XYZ，
+並以 gripper link 原點作為 IK 追蹤點。
 """
 
 import argparse
@@ -44,8 +45,9 @@ from pathlib import Path
 # - success_sample / StableSuccess：不依賴 Isaac Sim 的純任務判定邏輯。
 from a3_transport import Bridge, STEP_METERS
 from s4_task_logic import (
+    PitchOnlyClutch,
     StableSuccess,
-    map_webxr_translation_to_tool_heading,
+    map_calibrated_webxr_translation_to_base as map_webxr_translation_to_base,
     quaternion_xyzw_to_rotation_vector,
     success_sample,
 )
@@ -117,6 +119,26 @@ parser.add_argument(
     help="HDF5 file used by --record-demos",
 )
 parser.add_argument(
+    "--record-session-id",
+    default=None,
+    help="D-5 session identifier; required with --record-demos",
+)
+parser.add_argument("--record-teleop-mode", choices=("buttons", "imu", "webxr"), default="buttons")
+parser.add_argument("--record-operator-id", default="operator-001")
+parser.add_argument("--record-attempt-index", type=int, default=1)
+parser.add_argument("--record-condition-order", type=int, default=1)
+parser.add_argument("--record-step-mode", choices=("fine", "coarse"), default="fine")
+parser.add_argument("--record-robot-id", default="so101-sim-0")
+parser.add_argument("--record-app-version", default="unknown")
+parser.add_argument("--record-protocol-version", default="1")
+parser.add_argument("--record-controller-version", default="s4-hold-control-v1")
+parser.add_argument("--record-recorder-version", default="d5-recorder-v1")
+parser.add_argument("--record-git-commit", default="unknown")
+parser.add_argument("--record-rotation-gain", type=float, default=0.7)
+parser.add_argument("--record-rotation-deadband-deg", type=float, default=2.5)
+parser.add_argument("--record-rotation-smoothing", type=float, default=0.3)
+parser.add_argument("--record-position-gain", type=float, default=None)
+parser.add_argument(
     "--replay-hdf5",
     default=None,
     help="replay one S-3 HDF5 episode instead of accepting WebSocket commands",
@@ -143,6 +165,12 @@ if (
     parser.error("motion and task step counts must be positive")
 if args_cli.record_demos and args_cli.replay_hdf5:
     parser.error("--record-demos and --replay-hdf5 cannot be used together")
+if args_cli.record_demos and not args_cli.record_session_id:
+    parser.error("--record-demos requires --record-session-id for D-5 metadata")
+if args_cli.record_attempt_index < 1 or args_cli.record_condition_order < 1:
+    parser.error("record attempt and condition order must be >= 1")
+if args_cli.record_teleop_mode == "webxr" and args_cli.record_position_gain is None:
+    parser.error("--record-teleop-mode webxr requires --record-position-gain")
 if args_cli.operator_multiview and not args_cli.enable_cameras:
     parser.error("--operator-multiview requires --enable_cameras")
 
@@ -165,8 +193,6 @@ from isaaclab.controllers import DifferentialIKController, DifferentialIKControl
 from isaaclab.sensors.camera import Camera, CameraCfg
 from isaaclab.utils.math import matrix_from_quat, quat_inv, subtract_frame_transforms
 from leisaac.assets.robots.lerobot import SO101_FOLLOWER_CFG
-
-
 # -----------------------------------------------------------------------------
 # [控制與安全常數]
 # -----------------------------------------------------------------------------
@@ -966,6 +992,13 @@ def main():
     # -------------------------------------------------------------------------
     initial_ee_pos_b, _ = get_ee_pose_in_base(robot, ee_body_id)
     initial_ee_pos_b = initial_ee_pos_b.clone()
+    print(
+        "S4 BASE CONTROL READY "
+        f"body={EE_BODY_NAME} frame=robot_base mapping=phone_axes_20261025_v1 "
+        "control_modes=explicit_v2 default=translation "
+        f"initial_ee_b={vector_list(initial_ee_pos_b)}",
+        flush=True,
+    )
     print("S4 ROBOT BODY POSES [world m]", flush=True)
     for body_index, body_name in enumerate(robot.body_names):
         body_pos = robot.data.body_pose_w[0, body_index, :3].detach().cpu().tolist()
@@ -983,7 +1016,6 @@ def main():
     # position-driven 手臂在重力下可能有量測偏差；這個 offset 用來維持初始姿態。
     gravity_hold_offset = default_joint_pos[:, arm_joint_ids] - initial_arm_joint_pos
     arm_joint_limits = robot.data.soft_joint_pos_limits[:, arm_joint_ids, :].clone()
-
     ik_cfg = DifferentialIKControllerCfg(
         command_type="position",
         use_relative_mode=False,
@@ -1025,10 +1057,13 @@ def main():
     pose_command_ee_pos_b = None
     pose_start_orient_joint_pos = None
     pose_start_gripper_pos = None
-    pose_tool_forward_xy = (0.0, -1.0)
     pose_last_p_rel_m = [0.0, 0.0, 0.0]
     pose_last_q_rel = [0.0, 0.0, 0.0, 1.0]
     pose_last_gripper_delta = 0.0
+    pose_wrist_clutch = PitchOnlyClutch(
+        max_flex_deg=ORIENT_MAX_FLEX_DELTA_DEG,
+    )
+    pose_wrist_entry_arm_pos = None
     pose_was_workspace_clamped = False
     pose_was_joint_clamped = False
     pose_gripper_contact_count = 0
@@ -1055,11 +1090,83 @@ def main():
                 ) from exc
             raise
         rgb_shape = tuple(s3_camera.data.output["rgb"][0, ..., :3].shape)
+        control_params = {
+            "rotation_gain": None,
+            "rotation_deadband_deg": None,
+            "rotation_smoothing": None,
+            "step_mode": args_cli.record_step_mode,
+        }
+        if args_cli.record_teleop_mode != "buttons":
+            control_params.update(
+                {
+                    "rotation_gain": args_cli.record_rotation_gain,
+                    "rotation_deadband_deg": args_cli.record_rotation_deadband_deg,
+                    "rotation_smoothing": args_cli.record_rotation_smoothing,
+                }
+            )
+        if args_cli.record_teleop_mode == "webxr":
+            control_params["position_gain"] = args_cli.record_position_gain
+        source_devices = [
+            {
+                "device_id": "thomas-phone",
+                "role": "command_source",
+                "device_type": "phone",
+                "software_version": args_cli.record_app_version,
+                "clock_domain": "unix_epoch_ms",
+            },
+            {
+                "device_id": "leo-mac-relay",
+                "role": "bridge",
+                "device_type": "mac-relay",
+                "software_version": "mac-phone-relay-v1",
+                "clock_domain": "monotonic_s",
+            },
+            {
+                "device_id": args_cli.record_robot_id,
+                "role": "robot",
+                "device_type": "so101-sim",
+                "software_version": "leisaac-0.4.0",
+                "clock_domain": "sim_time_s",
+            },
+            {
+                "device_id": "s3-front-camera",
+                "role": "camera",
+                "device_type": "isaac-sim-camera",
+                "software_version": "unknown",
+                "clock_domain": "sim_time_s",
+            },
+            {
+                "device_id": "rtxws-recorder",
+                "role": "recorder",
+                "device_type": "server-container",
+                "software_version": args_cli.record_recorder_version,
+                "clock_domain": "sim_time_s",
+            },
+        ]
         s3_recorder = S3Recorder(
             output_path=args_cli.record_output,
             joint_names=robot.joint_names,
             image_shape=rgb_shape,
             task="S4 fixed red-cube pick and place",
+            recording_metadata={
+                "session_id": args_cli.record_session_id,
+                "teleop_mode": args_cli.record_teleop_mode,
+                "operator_id": args_cli.record_operator_id,
+                "attempt_index": args_cli.record_attempt_index,
+                "condition_order": args_cli.record_condition_order,
+                "environment_kind": "simulation",
+                "environment_name": "S4FixedPickPlace",
+                "robot_instance_id": args_cli.record_robot_id,
+                "control_params": control_params,
+                "source_devices": source_devices,
+                "software": {
+                    "app_version": args_cli.record_app_version,
+                    "recorder_version": args_cli.record_recorder_version,
+                    "controller_version": args_cli.record_controller_version,
+                    "protocol_version": args_cli.record_protocol_version,
+                    "git_commit": args_cli.record_git_commit,
+                },
+            },
         )
         _S3_RECORDER = s3_recorder
 
@@ -1626,25 +1733,13 @@ def main():
                     f"{math.degrees(orient_start_joint_pos[0, 1].item()):.3f}",
                     flush=True,
                 )
-            # pose_start：WebXR 位移控制 XYZ，同時沿用兩軸 wrist 映射，
-            # 拇指滑動則相對調整夾爪。三者共享同一份 latest-wins snapshot。
+            # pose_start：回到原始 base-frame 控制。WebXR 位移直接
+            # 映射到 robot base XYZ，IK 追蹤 gripper link 原點（非 TCP offset）。
             elif command_kind == "pose_start":
+                pose_wrist_clutch.reset()
+                pose_wrist_entry_arm_pos = None
                 pose_start_ee_pos_b = current_ee_pos_b.clone()
                 pose_command_ee_pos_b = current_ee_pos_b.clone()
-                pose_start_wrist_pos_b, _ = get_ee_pose_in_base(
-                    robot,
-                    wrist_body_id,
-                )
-                wrist_to_gripper_xy = (
-                    pose_start_ee_pos_b[0, :2] - pose_start_wrist_pos_b[0, :2]
-                )
-                heading_norm = torch.linalg.vector_norm(wrist_to_gripper_xy).item()
-                if heading_norm >= 1.0e-6:
-                    pose_tool_forward_xy = tuple(
-                        (wrist_to_gripper_xy / heading_norm).detach().cpu().tolist()
-                    )
-                else:
-                    pose_tool_forward_xy = (0.0, -1.0)
                 pose_start_orient_joint_pos = robot.data.joint_pos[
                     :, orient_joint_ids
                 ].clone()
@@ -1677,8 +1772,9 @@ def main():
                     f"position_gain={POSE_POSITION_GAIN:.2f} "
                     f"max_speed={pose_max_speed_m_s:.3f}m/s "
                     f"profile={'carry' if carrying else 'free'} "
-                    f"tool_forward_xy={pose_tool_forward_xy} "
-                    f"start={vector_list(pose_start_ee_pos_b)}",
+                    "frame_mapping=webxr_to_robot_base "
+                    f"control_mode={payload.get('control_mode', 'translation')} "
+                    f"start_ee={vector_list(pose_start_ee_pos_b)}",
                     flush=True,
                 )
             # gripper_jog_start／gripper：控制開合，關閉時包含接觸停止保護。
@@ -1739,18 +1835,33 @@ def main():
                 "orient_start": "orient_watchdog_timeout",
                 "pose_start": "pose_watchdog_timeout",
             }.get(command_kind, "execution_timeout")
-            bridge.update_state(ik="no_solution")
+            continuous_command = command_kind in {
+                "jog_start",
+                "joint_jog_start",
+                "gripper_jog_start",
+                "orient_start",
+                "pose_start",
+            }
+            bridge.update_state(ik="stopped" if continuous_command else "no_solution")
             bridge.finish(active, "rejected", timeout_reason)
-            bridge.engage_estop()
+            if continuous_command:
+                # A missed keepalive means "release the clutch": hold the
+                # measured pose immediately, but do not latch the global
+                # emergency stop.  Manual estop and non-finite math remain
+                # hard faults.
+                full_joint_target = robot.data.joint_pos.clone()
+            else:
+                bridge.engage_estop()
             print(
-                f"[A3 REJECT] seq={active['seq']} reason={timeout_reason}",
+                f"[A3 {'HOLD STOP' if continuous_command else 'REJECT'}] "
+                f"seq={active['seq']} reason={timeout_reason}",
                 flush=True,
             )
             active = None
             continue
 
         # ---------------------------------------------------------------------
-        # [active 執行 A] WebXR 6-DoF：XYZ + 兩軸 wrist + 夾爪
+        # [active 執行 A] base-frame WebXR；每次按住明確選平移或 wrist-only。
         # ---------------------------------------------------------------------
         if command_kind == "pose_start":
             current_ee_pos_b, current_ee_quat_b = get_ee_pose_in_base(
@@ -1775,6 +1886,15 @@ def main():
                 details = {
                     "frame": payload["frame"],
                     "position_gain": POSE_POSITION_GAIN,
+                    "coordinates": "gripper_link_in_robot_base",
+                    "control_mode": payload.get("control_mode", "translation"),
+                    "pitch_mode": "wrist_only" if pose_wrist_clutch.active else "translation",
+                    "pitch_x_deg": math.degrees(rotation_vector[0]),
+                    "wrist_flex_actual_deg": math.degrees(final_orient_joint_pos[0, 0].item()),
+                    "arm_delta_since_wrist_entry_deg": (
+                        torch.rad2deg(final_arm_joint_pos - pose_wrist_entry_arm_pos)[0].tolist()
+                        if pose_wrist_entry_arm_pos is not None else None
+                    ),
                     "webxr_delta_m": list(pose_last_p_rel_m),
                     "start_m": vector_list(pose_start_ee_pos_b),
                     "end_m": vector_list(current_ee_pos_b),
@@ -1814,9 +1934,73 @@ def main():
             pose_last_q_rel = pose["q_rel"]
             pose_last_gripper_delta = pose["gripper_delta"]
 
-            mapped_delta_b = map_webxr_translation_to_tool_heading(
+            # The UI chooses a mode once per press; never infer it from tilt.
+            was_wrist_only = pose_wrist_clutch.active
+            try:
+                wrist_targets = pose_wrist_clutch.update(
+                    pose_last_q_rel, full_joint_target[0].tolist(),
+                    flex_index=orient_joint_ids[0],
+                    start_flex=pose_start_orient_joint_pos[0, 0].item(),
+                    flex_sign=ORIENT_FLEX_SIGN,
+                    lower=orient_joint_limits[0, 0, 0].item(),
+                    upper=orient_joint_limits[0, 0, 1].item(),
+                    max_step=MAX_JOINT_DELTA_RAD,
+                    control_mode=payload.get("control_mode", "translation"),
+                )
+            except ValueError as exc:
+                bridge.finish(active, "rejected", "pose_wrist_invalid_input")
+                bridge.engage_estop()
+                full_joint_target = robot.data.joint_pos.clone()
+                print(f"[S4 POSE REJECT] invalid wrist input: {exc}", flush=True)
+                active = None
+                continue
+            if wrist_targets is not None:
+                if not was_wrist_only:
+                    pose_wrist_entry_arm_pos = robot.data.joint_pos[:, arm_joint_ids].clone()
+                    print(
+                        f"[S4 POSE WRIST-ONLY START] seq={active['seq']} "
+                        f"pitch_x_deg={math.degrees(pose_wrist_clutch.pitch_rad):.2f} "
+                        f"held_arm_targets_deg={torch.rad2deg(full_joint_target[:, arm_joint_ids])[0].tolist()}",
+                        flush=True,
+                    )
+                full_joint_target = torch.tensor(
+                    [wrist_targets], device=robot.device, dtype=full_joint_target.dtype
+                )
+                held_gripper_target = full_joint_target[:, gripper_joint_id].clone()
+                pose_last_gripper_delta = 0.0  # Gripper is held in wrist-only mode.
+                pose_was_joint_clamped |= pose_wrist_clutch.clamped
+                step_simulation(sim, robot, full_joint_target, sim_dt, (task_object,))
+                final_ee_pos_b, _ = get_ee_pose_in_base(robot, ee_body_id)
+                if not (torch.isfinite(robot.data.joint_pos).all().item()
+                        and torch.isfinite(final_ee_pos_b).all().item()):
+                    bridge.finish(active, "rejected", "pose_wrist_nonfinite_state")
+                    bridge.engage_estop()
+                    active = None
+                    continue
+                motion_step += 1
+                bridge.update_state(
+                    ik="orient_clamped" if pose_wrist_clutch.clamped else "orienting",
+                    ee_pos=vector_list(final_ee_pos_b),
+                    orient_deg=math.degrees(pose_wrist_clutch.pitch_rad),
+                    gripper_delta=0.0,
+                )
+                if motion_step % 30 == 0:
+                    arm_drift = torch.rad2deg(
+                        robot.data.joint_pos[:, arm_joint_ids] - pose_wrist_entry_arm_pos
+                    )[0].tolist()
+                    print(
+                        f"[S4 POSE WRIST-ONLY] seq={active['seq']} step={motion_step} "
+                        f"pitch_x_deg={math.degrees(pose_wrist_clutch.pitch_rad):.2f} "
+                        f"wrist_flex_target_deg={math.degrees(wrist_targets[orient_joint_ids[0]]):.2f} "
+                        f"wrist_flex_actual_deg={math.degrees(robot.data.joint_pos[0, orient_joint_ids[0]].item()):.2f} "
+                        f"arm_actual_delta_deg={arm_drift} translation_ignored=True",
+                        flush=True,
+                    )
+                time.sleep(sim_dt)
+                continue  # Never run translation IK for this latched gesture.
+
+            mapped_delta_b = map_webxr_translation_to_base(
                 pose_last_p_rel_m,
-                pose_tool_forward_xy,
                 POSE_POSITION_GAIN,
             )
             requested_pose_target = pose_start_ee_pos_b + torch.tensor(
@@ -1840,9 +2024,6 @@ def main():
                 pose_was_workspace_clamped or pose_workspace_clamped_now
             )
 
-            # Limit the target's travel per physics step.  The App also rejects
-            # a dropped/whipped phone, but this server-side limit remains the
-            # final safety boundary for delayed or bursty network updates.
             target_delta = desired_pose_target - pose_command_ee_pos_b
             target_delta_norm = torch.linalg.vector_norm(target_delta, dim=1)[0]
             max_position_step_m = pose_max_speed_m_s * sim_dt
@@ -1855,20 +2036,8 @@ def main():
             rotation_vector = quaternion_xyzw_to_rotation_vector(
                 pose_last_q_rel
             )
-            flex_delta_rad = max(
-                -math.radians(ORIENT_MAX_FLEX_DELTA_DEG),
-                min(
-                    math.radians(ORIENT_MAX_FLEX_DELTA_DEG),
-                    ORIENT_FLEX_SIGN * rotation_vector[0],
-                ),
-            )
-            roll_delta_rad = max(
-                -math.radians(ORIENT_MAX_ROLL_DELTA_DEG),
-                min(
-                    math.radians(ORIENT_MAX_ROLL_DELTA_DEG),
-                    ORIENT_ROLL_SIGN * rotation_vector[1],
-                ),
-            )
+            flex_delta_rad = 0.0  # Translation mode ignores all phone rotation.
+            roll_delta_rad = 0.0  # Translation mode holds both wrist targets.
             requested_orient_target = pose_start_orient_joint_pos + torch.tensor(
                 [[flex_delta_rad, roll_delta_rad]],
                 device=robot.device,
@@ -2024,9 +2193,6 @@ def main():
                     f"gripper_delta={pose_last_gripper_delta:+.3f}",
                     flush=True,
                 )
-            # Rendering three operator views can already consume most or all
-            # of a 1/60 s frame.  Only sleep for the unused part of the frame;
-            # a fixed extra sleep here made AR tracking unnecessarily laggy.
             pose_step_remaining_s = sim_dt - (
                 time.monotonic() - pose_step_started_at
             )

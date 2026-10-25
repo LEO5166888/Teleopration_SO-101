@@ -2,6 +2,7 @@
 """Small 30 Hz HDF5 recorder for the direct-workflow S-4 simulation."""
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import h5py
@@ -11,17 +12,43 @@ import numpy as np
 SCHEMA_VERSION = "s3-v1"
 FPS = 30
 PHYSICS_STEPS_PER_SAMPLE = 2
+D5_RECORDING_SPEC_VERSION = "d5-v1"
+D5_JOINT_NAMES = (
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll",
+    "gripper",
+)
 
 
 class S3Recorder:
     """Write one temporary episode and publish it only after task success."""
 
-    def __init__(self, output_path, joint_names, image_shape, task):
+    def __init__(
+        self,
+        output_path,
+        joint_names,
+        image_shape,
+        task,
+        *,
+        task_id="s4-fixed-pick-place-v1",
+        recording_metadata=None,
+    ):
         self.output_path = Path(output_path)
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self.joint_names = list(joint_names)
         self.image_shape = tuple(image_shape)
         self.task = task
+        self.task_id = task_id
+        self.recording_metadata = dict(recording_metadata or {})
+        if self.recording_metadata and tuple(self.joint_names) != D5_JOINT_NAMES:
+            raise ValueError(
+                "D-5 joint order mismatch: "
+                f"expected {D5_JOINT_NAMES}, got {tuple(self.joint_names)}"
+            )
+        self._validate_recording_metadata()
         self.stream = h5py.File(self.output_path, "a")
         self.data = self.stream.require_group("data")
         self.data.attrs["env_args"] = json.dumps(
@@ -38,6 +65,45 @@ class S3Recorder:
         self.sample_count = 0
         self.physics_phase = 0
         self.capture_started = False
+        self.source_episode = None
+        self.created_at_utc = None
+
+    def _validate_recording_metadata(self):
+        if not self.recording_metadata:
+            return
+        required = {
+            "session_id",
+            "teleop_mode",
+            "operator_id",
+            "attempt_index",
+            "condition_order",
+            "environment_kind",
+            "environment_name",
+            "robot_instance_id",
+            "control_params",
+            "source_devices",
+            "software",
+        }
+        missing = sorted(required - set(self.recording_metadata))
+        if missing:
+            raise ValueError(f"D-5 recording metadata missing fields: {missing}")
+        if self.recording_metadata["teleop_mode"] not in {"buttons", "imu", "webxr"}:
+            raise ValueError("teleop_mode must be buttons, imu, or webxr")
+        if int(self.recording_metadata["attempt_index"]) < 1:
+            raise ValueError("attempt_index must be >= 1")
+        if int(self.recording_metadata["condition_order"]) < 1:
+            raise ValueError("condition_order must be >= 1")
+        controls = self.recording_metadata["control_params"]
+        if self.recording_metadata["teleop_mode"] == "buttons":
+            for field in (
+                "rotation_gain",
+                "rotation_deadband_deg",
+                "rotation_smoothing",
+            ):
+                if controls.get(field) is not None:
+                    raise ValueError(f"buttons requires control_params.{field}=None")
+        if controls.get("step_mode") not in {"fine", "coarse"}:
+            raise ValueError("control_params.step_mode must be fine or coarse")
 
     @property
     def active(self):
@@ -56,6 +122,12 @@ class S3Recorder:
         episode.attrs["ee_frame"] = "base"
         episode.attrs["quaternion_order"] = "wxyz"
         episode.attrs["source_episode"] = int(source_episode)
+        self.source_episode = int(source_episode)
+        self.created_at_utc = datetime.now(timezone.utc).isoformat().replace(
+            "+00:00", "Z"
+        )
+        if self.recording_metadata:
+            self._write_d5_flat_attrs(episode)
 
         timestamps = episode.create_group("timestamps")
         observations = episode.create_group("obs")
@@ -87,6 +159,28 @@ class S3Recorder:
         self.physics_phase = 0
         self.capture_started = False
         self.stream.flush()
+
+    def _write_d5_flat_attrs(self, episode):
+        metadata = self.recording_metadata
+        episode.attrs["recording_spec_version"] = D5_RECORDING_SPEC_VERSION
+        episode.attrs["session_id"] = metadata["session_id"]
+        episode.attrs["episode_id"] = self.source_episode
+        episode.attrs["created_at_utc"] = self.created_at_utc
+        episode.attrs["teleop_mode"] = metadata["teleop_mode"]
+        episode.attrs["operator_id"] = metadata["operator_id"]
+        episode.attrs["attempt_index"] = int(metadata["attempt_index"]) + self.source_episode
+        episode.attrs["condition_order"] = int(metadata["condition_order"])
+        episode.attrs["task_id"] = self.task_id
+        episode.attrs["environment"] = metadata["environment_kind"]
+        episode.attrs["robot_id"] = metadata["robot_instance_id"]
+        episode.attrs["control_params"] = json.dumps(
+            metadata["control_params"],
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for field, value in metadata["software"].items():
+            episode.attrs[field] = value
 
     @staticmethod
     def _dataset(group, name, tail_shape, dtype):
@@ -168,6 +262,9 @@ class S3Recorder:
             return None
         self.episode.attrs.modify("num_samples", self.sample_count)
         self.episode.attrs.modify("success", True)
+        self.episode.attrs["termination_reason"] = "task_success"
+        if self.recording_metadata:
+            self.episode.attrs["d5_metadata_json"] = self._build_d5_metadata_json()
         demo_index = self._next_demo_index()
         demo_name = f"demo_{demo_index}"
         self.data.move("_tmp_episode", demo_name)
@@ -179,6 +276,53 @@ class S3Recorder:
         )
         self.stream.flush()
         return demo_name, self.sample_count
+
+    def _build_d5_metadata_json(self):
+        metadata = self.recording_metadata
+        record = {
+            "schema_version": D5_RECORDING_SPEC_VERSION,
+            "session_id": metadata["session_id"],
+            "episode_id": self.source_episode,
+            "created_at_utc": self.created_at_utc,
+            "teleop_mode": metadata["teleop_mode"],
+            "task": {"id": self.task_id, "instruction": self.task},
+            "recording": {
+                "fps": FPS,
+                "primary_clock": "sim_time_s",
+                "num_frames": self.sample_count,
+                "nominal_duration_s": self.sample_count / FPS,
+            },
+            "environment": {
+                "kind": metadata["environment_kind"],
+                "name": metadata["environment_name"],
+            },
+            "robot": {
+                "model": "so101",
+                "instance_id": metadata["robot_instance_id"],
+                "joint_names": self.joint_names,
+                "ee_frame": "base",
+                "quaternion_order": "wxyz",
+            },
+            "operator": {
+                "operator_id": metadata["operator_id"],
+                "attempt_index": int(metadata["attempt_index"]) + self.source_episode,
+                "condition_order": int(metadata["condition_order"]),
+            },
+            "control_params": metadata["control_params"],
+            "source_devices": metadata["source_devices"],
+            "software": metadata["software"],
+            "outcome": {
+                "success": True,
+                "termination_reason": "task_success",
+            },
+        }
+        return json.dumps(
+            record,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
     def _next_demo_index(self):
         indices = []
@@ -200,6 +344,8 @@ class S3Recorder:
         self.sample_count = 0
         self.physics_phase = 0
         self.capture_started = False
+        self.source_episode = None
+        self.created_at_utc = None
         self.stream.flush()
         return count
 
